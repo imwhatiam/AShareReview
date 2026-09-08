@@ -1,0 +1,13 @@
+{
+  "name": "a-share-market-review-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "echo 'Frontend build is introduced in T39.'",
+    "lint": "echo 'Frontend lint is introduced in T39.'",
+    "test": "echo 'Frontend tests are introduced in T39.'"
+  }
+}

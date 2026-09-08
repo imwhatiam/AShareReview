@@ -12,6 +12,15 @@ https://docs.djangoproject.com/en/6.1/ref/settings/
 
 from pathlib import Path
 
+from core.module_registry import get_enabled_app_configs
+
+from backend.env import (
+    get_bool_setting,
+    get_list_setting,
+    get_path_setting,
+    get_required_setting,
+)
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -20,17 +29,19 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-xup_!7l2m-=6@8mc(x9o4mbd#pwr_px1&!b5t&3wn0fw$2!pz0'
+SECRET_KEY = get_required_setting('DJANGO_SECRET_KEY')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = get_bool_setting('DJANGO_DEBUG', default=False)
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = get_list_setting('DJANGO_ALLOWED_HOSTS')
 
 
 # Application definition
 
 INSTALLED_APPS = [
+    'core.apps.CoreConfig',
+    *get_enabled_app_configs(),
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -75,9 +86,30 @@ WSGI_APPLICATION = 'backend.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
-    }
+        'NAME': get_path_setting('CORE_DATABASE_PATH'),
+    },
+    'kaipanla': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': get_path_setting('KAIPANLA_DATABASE_PATH'),
+    },
+    'eastmoney': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': get_path_setting('EASTMONEY_DATABASE_PATH'),
+    },
+    'stock_moves': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': get_path_setting('STOCK_MOVES_DATABASE_PATH'),
+    },
+    'sector_momentum': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': get_path_setting('SECTOR_MOMENTUM_DATABASE_PATH'),
+    },
+    'hundred_day': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': get_path_setting('HUNDRED_DAY_DATABASE_PATH'),
+    },
 }
+DATABASE_ROUTERS = ['backend.db_router.AppDatabaseRouter']
 
 
 # Password validation
@@ -104,7 +136,7 @@ AUTH_PASSWORD_VALIDATORS = [
 
 LANGUAGE_CODE = 'en-us'
 
-TIME_ZONE = 'UTC'
+TIME_ZONE = get_required_setting('DJANGO_TIME_ZONE')
 
 USE_I18N = True
 

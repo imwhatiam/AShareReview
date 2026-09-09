@@ -1,5 +1,5 @@
 from decimal import Decimal
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from django.test import SimpleTestCase
 
@@ -98,6 +98,47 @@ class KaipanlaSectorFundFlowFetcherTests(SimpleTestCase):
         self.assertFalse(result.is_complete)
         self.assertEqual(result.completed_page_count, 0)
         self.assertEqual(result.rows, ())
+
+    def test_client_settings_allow_blank_credentials_and_omit_their_fields(self):
+        from kaipanla.services.client import (
+            KaipanlaSectorFundFlowClient,
+            flow_client_settings,
+        )
+
+        class Response:
+            status_code = 200
+            text = r'{"errcode":0,"list":[["BK001","\u534a\u5bfc\u4f53"]]}'
+
+        settings = {
+            'KAIPANLA_API_URL': 'https://example.invalid',
+            'KPL_DEVICE_ID': '',
+            'KPL_USER_ID': '',
+            'KPL_TOKEN': '',
+            'KPL_VERSION': '5.23.0.4',
+            'KPL_API_VERSION': 'w44',
+            'KPL_PHONE_OS_NEW': '1',
+            'KAIPANLA_TIMEOUT_SECONDS': '1',
+            'KAIPANLA_FLOW_CONTROLLER': 'ZhiShuRanking',
+            'KAIPANLA_FLOW_ACTION': 'RealRankingInfo',
+            'KAIPANLA_FLOW_ORDER': '1',
+            'KAIPANLA_FLOW_TYPE': '1',
+            'KAIPANLA_FLOW_ZS_TYPE': '7',
+            'KAIPANLA_FLOW_PAGE_SIZE': '80',
+            'KAIPANLA_REQUEST_DELAY_SECONDS': '0',
+        }
+        transport = Mock()
+        transport.post.return_value = Response()
+
+        with patch.dict('os.environ', settings, clear=False):
+            client = KaipanlaSectorFundFlowClient(
+                settings=flow_client_settings(), transport=transport
+            )
+            client.fetch_page(0)
+
+        posted = transport.post.call_args.kwargs['data']
+        self.assertNotIn('DeviceID', posted)
+        self.assertNotIn('UserID', posted)
+        self.assertNotIn('Token', posted)
 
     def test_client_decodes_raw_unicode_escaped_payload_and_rejects_invalid_json(self):
         from kaipanla.services.client import (

@@ -73,8 +73,8 @@ def _request_delay_setting() -> float:
 
 def _settings() -> _ClientSettings:
     return _ClientSettings(
-        endpoint=get_required_setting('KAIPANLA_API_URL'),
-        device_id=get_required_setting('KPL_DEVICE_ID'),
+        endpoint=get_required_setting('KAIPANLA_INDUSTRY_API_URL'),
+        device_id=get_setting('KPL_DEVICE_ID', '') or '',
         user_id=get_setting('KPL_USER_ID', '') or '',
         token=get_setting('KPL_TOKEN', '') or '',
         version=get_required_setting('KPL_VERSION'),
@@ -126,7 +126,7 @@ class KaipanlaIndustryClient:
             raise ValueError('Parent industry code is required.')
         payload = self._post(
             {
-                **self._common_params(include_credentials=False),
+                **self._common_params(include_credentials=True),
                 'a': get_required_setting('KAIPANLA_CHILD_INDUSTRY_ACTION'),
                 'c': self._settings.controller,
                 'IsShow': self._settings.child_show,
@@ -207,10 +207,11 @@ class KaipanlaIndustryClient:
     def _common_params(self, *, include_credentials):
         params = {
             'PhoneOSNew': self._settings.phone_os_new,
-            'DeviceID': self._settings.device_id,
             'VerSion': self._settings.version,
             'apiv': self._settings.api_version,
         }
+        if self._settings.device_id:
+            params['DeviceID'] = self._settings.device_id
         if include_credentials and self._settings.user_id:
             params['UserID'] = self._settings.user_id
         if include_credentials and self._settings.token:

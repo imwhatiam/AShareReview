@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 from django.core.management import call_command
 from django.core.management.base import CommandError
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase
 
 from core.models import DataVersion, IndustrySnapshot
 
@@ -37,6 +37,13 @@ class FakeKaipanlaIndustryClient:
         if isinstance(value, Exception):
             raise value
         return tuple(value)
+
+
+class IndustrySnapshotNormalizationTests(SimpleTestCase):
+    def test_empty_child_stock_list_is_preserved_as_an_empty_list(self):
+        from core.services.sync_industries import _normalize_stock_codes
+
+        self.assertEqual(_normalize_stock_codes([], '801058'), [])
 
 
 class KaipanlaIndustrySnapshotCommandTests(TestCase):

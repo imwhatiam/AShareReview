@@ -30,6 +30,7 @@ class RecordingTransport:
 class KaipanlaIndustryClientTests(SimpleTestCase):
     settings = {
         'KAIPANLA_API_URL': 'https://example.test/w1/api/index.php',
+        'KAIPANLA_INDUSTRY_API_URL': 'https://history.example.test/w1/api/index.php',
         'KPL_DEVICE_ID': 'device-id',
         'KPL_USER_ID': 'user-id',
         'KPL_TOKEN': 'token-value',
@@ -58,6 +59,25 @@ class KaipanlaIndustryClientTests(SimpleTestCase):
         'KAIPANLA_INDUSTRY_DATE': '2026-09-08',
     }
 
+    def test_industry_requests_use_the_independently_configured_history_endpoint(self):
+        from core.integrations.kaipanla.client import KaipanlaIndustryClient
+
+        transport = RecordingTransport([
+            FakeResponse(200, {'errcode': 0, 'list': [['801660', '通信']]}),
+        ])
+        settings = {
+            **self.settings,
+            'KAIPANLA_INDUSTRY_API_URL': 'https://history.example.test/w1/api/index.php',
+        }
+
+        with patch.dict('os.environ', settings, clear=False):
+            KaipanlaIndustryClient(transport=transport).list_parent_industries()
+
+        self.assertEqual(
+            transport.calls[0]['url'],
+            settings['KAIPANLA_INDUSTRY_API_URL'],
+        )
+
     def test_parent_industry_request_uses_configured_real_ranking_contract(self):
         from core.integrations.kaipanla.client import KaipanlaIndustryClient
 
@@ -76,7 +96,7 @@ class KaipanlaIndustryClientTests(SimpleTestCase):
             {'industry_code': '801660', 'industry_name': '通信'},
             {'industry_code': '801670', 'industry_name': '传媒'},
         ))
-        self.assertEqual(transport.calls[0]['url'], self.settings['KAIPANLA_API_URL'])
+        self.assertEqual(transport.calls[0]['url'], self.settings['KAIPANLA_INDUSTRY_API_URL'])
         self.assertEqual(transport.calls[0]['data'], {
             'PhoneOSNew': '1',
             'DeviceID': 'device-id',
@@ -95,7 +115,7 @@ class KaipanlaIndustryClientTests(SimpleTestCase):
         })
         self.assertEqual(transport.calls[1]['data']['Index'], '2')
 
-    def test_child_request_excludes_optional_credentials_and_returns_actual_children(self):
+    def test_child_request_uses_configured_credentials_and_returns_actual_children(self):
         from core.integrations.kaipanla.client import KaipanlaIndustryClient
 
         transport = RecordingTransport([
@@ -115,12 +135,41 @@ class KaipanlaIndustryClientTests(SimpleTestCase):
             'DeviceID': 'device-id',
             'VerSion': '5.23.0.4',
             'apiv': 'w44',
+            'UserID': 'user-id',
+            'Token': 'token-value',
             'a': 'SonPlate_Info',
             'c': 'ZhiShuRanking',
             'IsShow': '1',
             'Date': '2026-09-08',
             'PlateID': '801660',
         })
+
+    def test_industry_requests_allow_blank_credentials_and_omit_their_fields(self):
+        from core.integrations.kaipanla.client import KaipanlaIndustryClient
+
+        transport = RecordingTransport([
+            FakeResponse(200, {'errcode': 0, 'list': [['801660', '通信']]}),
+            FakeResponse(200, {'errcode': 0, 'List': [['801206', '光模块']]}),
+            FakeResponse(200, {'errcode': 0, 'list': [['000001', '平安银行']]}),
+        ])
+        settings = {
+            **self.settings,
+            'KPL_DEVICE_ID': '',
+            'KPL_USER_ID': '',
+            'KPL_TOKEN': '',
+        }
+
+        with patch.dict('os.environ', settings, clear=False):
+            client = KaipanlaIndustryClient(transport=transport)
+            client.list_parent_industries()
+            client.list_child_industries('801660')
+            client.list_stock_codes('801206')
+
+        self.assertEqual(len(transport.calls), 3)
+        for call in transport.calls:
+            self.assertNotIn('DeviceID', call['data'])
+            self.assertNotIn('UserID', call['data'])
+            self.assertNotIn('Token', call['data'])
 
     def test_stock_list_paginates_and_deduplicates_codes(self):
         from core.integrations.kaipanla.client import KaipanlaIndustryClient

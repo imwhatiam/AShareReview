@@ -12,8 +12,10 @@
 | `python manage.py test backend.tests.test_module_isolation backend.tests.test_security_settings backend.tests.test_source_policy` | 14 tests passed |
 | `./scripts/check_module_matrix.sh` | 五种 `core + 单业务 App` 配置的 check、迁移计划、命令/URL 发现及单 App 测试通过；未请求真实上游 |
 | `python manage.py check` 与 `python manage.py makemigrations --check --dry-run` | 均通过；没有待生成迁移 |
-| `python manage.py test` | 232 tests passed |
+| `python manage.py test` | 234 tests passed |
 | 前端 `npm test -- --run`、`npm run lint`、`npm run build` | 49 tests、lint、build 全部通过；构建仅产生 ECharts 体积提示，不阻断构建 |
+| 开盘啦受控真实上游验证（携带当前 `.env` 三项 KPL 配置 / 显式省略三个字段） | 两种模式均可完成资金流完整分页及父行业→子行业→股票列表链路；股票列表使用已发布的 2026-09-08 快照。2026-09-09 盘中当日股票列表的不可用与认证无关。 |
+| `python manage.py test core.tests.test_kaipanla_industry_adapter kaipanla.tests.test_fetcher backend.tests.test_security_settings` | 16 tests passed；覆盖三类 KPL 字段为空时省略、非空时携带的契约。 |
 
 真实网页/API、真实上游采集及部署环境验收仍未执行，原因和后续步骤见下文“待所有者提供环境后执行的受控运行时验收”。
 
@@ -46,10 +48,10 @@
 | AC-CORE-008 | `core/tests/test_dataset_models.py`、同步命令测试 | 自动化 |
 | AC-SRC-000 | `core/tests/test_hithink_adapter.py`、`backend/tests/test_source_policy.py` | 自动化 |
 | AC-SRC-000A | `core/tests/test_hithink_adapter.py`、`test_sync_daily_prices_commands.py` | 自动化 |
-| AC-SRC-000B | `core/tests/test_kaipanla_industry_adapter.py`、`test_sync_industries_commands.py` | 自动化 |
+| AC-SRC-000B | `core/tests/test_kaipanla_industry_adapter.py`、`test_sync_industries_commands.py`；2026-09-09 真实上游验证 | 自动化；真实上游已验证（股票列表使用 2026-09-08 已发布快照） |
 | AC-SRC-001 | `backend/tests/test_source_policy.py` | 自动化 |
 | AC-SRC-002 | `backend/tests/test_security_settings.py`、`.gitignore` | 自动化；人工代码审查 |
-| AC-SRC-003 | `kaipanla/tests/test_fetcher.py`、`core/tests/test_kaipanla_industry_adapter.py` | 自动化 |
+| AC-SRC-003 | `kaipanla/tests/test_fetcher.py`、`core/tests/test_kaipanla_industry_adapter.py`、`backend/tests/test_security_settings.py`；2026-09-09 真实上游验证 | 自动化；真实上游已验证 |
 | AC-SRC-004 | `eastmoney/tests/test_fetcher.py`、`eastmoney/tests/test_command.py` | 自动化 |
 | AC-SRC-005 | `core/tests/test_management_contract.py`、日志脱敏相关测试 | 自动化 |
 | AC-SRC-006 | `core/tests/test_hithink_adapter.py`、资金流 fetcher 测试 | 自动化 |

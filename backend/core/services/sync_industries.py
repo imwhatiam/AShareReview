@@ -40,8 +40,6 @@ def _normalize_stock_codes(stock_codes: Any, industry_code: str) -> list[str]:
     if not isinstance(stock_codes, (tuple, list)):
         raise ValueError(f'Kaipanla stock list for {industry_code} is invalid.')
     normalized = sorted({str(stock_code).strip() for stock_code in stock_codes if str(stock_code).strip()})
-    if not normalized:
-        raise ValueError(f'Kaipanla stock list for {industry_code} is empty.')
     return normalized
 
 

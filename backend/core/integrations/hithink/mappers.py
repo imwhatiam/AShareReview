@@ -47,9 +47,13 @@ def _integer_or_none(item: dict, field: str) -> int | None:
     value = item.get(field)
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, int):
+    if isinstance(value, bool):
         raise HithinkPayloadError(f'Upstream field {field!r} is invalid.')
-    return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    raise HithinkPayloadError(f'Upstream field {field!r} is invalid.')
 
 
 def _date_from_milliseconds(value: int):

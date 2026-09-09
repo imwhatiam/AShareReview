@@ -27,9 +27,10 @@
 | 缓存与锁 | `FILE_CACHE_*`、`LOCK_DIRECTORY`、`REMOTE_REPAIR_*` | 修复路径最多一次远程尝试、硬超时默认不超过 5 秒；不要将全市场初始化放进 Web 请求。 |
 | 模块开关 | `ENABLED_MODULES` | 逗号分隔的静态模块列表；可独立关闭一个业务模块。 |
 | 同花顺 REST | `HITHINK_FINANCE_*` | 只用于股票表、交易日和前复权日线；`HITHINK_FINANCE_API_KEY` 仅放在 `.env`。 |
-| 开盘啦 | `KAIPANLA_*`、`KPL_*` | 用于板块资金流和父行业→子行业→股票关系；凭据不能出现在日志或版本库。 |
+| 开盘啦 | `KAIPANLA_*`、`KPL_*` | 用于板块资金流和父行业→子行业→股票关系。`KPL_DEVICE_ID`、`KPL_USER_ID`、`KPL_TOKEN` 均可留空；空值不会作为字段发出，非空值才附带。凭据不能出现在日志或版本库。 |
 | 东方财富 | `EASTMONEY_*` | 用于东方财富板块资金流；403、429、超时和屏蔽允许失败。 |
 | 浏览器安全 | `SESSION_COOKIE_*`、`CSRF_COOKIE_*`、`CSRF_TRUSTED_ORIGINS` | 生产 HTTPS 下保持 secure cookie 为 `true`，可信来源填写实际 `https://` 域名。当前版本按同源部署，不启用跨域 CORS。 |
+| 本地 Vite 代理 | `VITE_DEV_BACKEND_ORIGIN` | 仅本地开发使用。Vite 将浏览器的相对 `/api/` 请求代理到该 Django 地址，避免跨域 Session/CSRF Cookie 问题；生产静态部署不使用此项。 |
 
 生产示例只表达结构，不包含真实值：
 
@@ -44,7 +45,22 @@ SESSION_COOKIE_SECURE=true
 CSRF_COOKIE_SECURE=true
 ```
 
-## 3. 初始化六个 SQLite 数据库
+## 3. 本地前后端联调
+
+本地使用 Vite 时，浏览器中的请求地址会显示为 `http://localhost:5173/api/...`；这是开发代理入口，而不是由 Vite 提供业务 API。Vite 会把 `/api/` 转发到根目录 `.env` 中的 `VITE_DEV_BACKEND_ORIGIN`，本地默认值为 `http://127.0.0.1:8000`。这样 Django 接收到实际 API 请求，同时浏览器仍在同一前端来源保存和发送 Session、CSRF Cookie。
+
+本地纯 HTTP 开发时，在本地 `.env` 中设置以下值（不能复制到生产环境）：
+
+```dotenv
+VITE_DEV_BACKEND_ORIGIN=http://127.0.0.1:8000
+CSRF_TRUSTED_ORIGINS=http://localhost:5173
+SESSION_COOKIE_SECURE=false
+CSRF_COOKIE_SECURE=false
+```
+
+生产环境由 HTTPS 反向代理把前端与 `/api/` 放到同一公开域名下，因此不使用 Vite 代理，也必须保持两项 `*_COOKIE_SECURE=true`。
+
+## 4. 初始化六个 SQLite 数据库
 
 所有命令从 `backend/` 目录执行。路由器只允许 `core` 写入 `default`，每个业务 App 写入同名数据库。按下面顺序执行一次迁移；可安全重复执行。
 
@@ -62,7 +78,7 @@ python manage.py createsuperuser
 
 管理员通过 `/admin/` 查看公共数据版本、模块运行状态及各模块数据；后台只查看状态，不提供在线启动、停止或重跑采集命令。
 
-## 4. 首次数据准备（只运行一次）
+## 5. 首次数据准备（只运行一次）
 
 在全新数据库中，按顺序执行：
 
@@ -77,7 +93,7 @@ python manage.py init_stock_daily_prices --years 1
 
 开盘啦子行业记录会存入 `core` 数据库，但当前 API 和前端只使用、展示父行业。父行业的股票列表由其子行业股票去重汇总；同一股票属于多个父行业时保留多重归属。
 
-## 5. 日常 crontab（五个逻辑组）
+## 6. 日常 crontab（五个逻辑组）
 
 先在 `crontab -e` 顶部声明时区和绝对路径。百分号在 crontab 中必须写成 `\%`。下面示例将标准输出和错误输出分开追加到 `backend/logs/`；一个命令失败不会中断其他行。
 
@@ -116,13 +132,13 @@ PYTHON=/srv/a-share-market-review/.venv/bin/python
 
 东方财富可被上游临时屏蔽。发生 403、429、超时、限流或无数据时，命令应以非零退出并记录失败状态，但不会删除旧快照、不会主动失效缓存、不会影响开盘啦或其他定时任务，也不会发送外部通知。没有旧数据时，该模块 API 返回 `202 DATA_PREPARING` 或本地无数据状态；前端可以没有内容。
 
-## 6. 前端静态文件与 HTTPS
+## 7. 前端静态文件与 HTTPS
 
 - 反向代理应通过 HTTPS 提供 `frontend/dist/`，并将 `/api/`、`/admin/` 代理给 Django。当前版本按同源部署：仅接受配置在 `DJANGO_ALLOWED_HOSTS` 和 `CSRF_TRUSTED_ORIGINS` 中的域名，不应依赖 `CORS_ALLOWED_ORIGINS` 实现跨域访问。
 - Django 管理后台依赖静态文件。生产反向代理需要把 Django 收集后的静态目录映射到 `/static/`；在启用服务前，确认当前部署配置已经提供可写的 Django `STATIC_ROOT` 并成功执行 `python manage.py collectstatic`。若未配置该目录，先补齐部署配置，不能假设开发服务器的静态文件行为适用于生产。
 - 不在 HTTP 环境中把 `SESSION_COOKIE_SECURE` 或 `CSRF_COOKIE_SECURE` 改为 `false`。本地纯 HTTP 调试如必须临时改动，仅限本地 `.env`，不得进入生产 `.env.example` 或源码。
 
-## 7. 备份、清理、故障恢复与回滚
+## 8. 备份、清理、故障恢复与回滚
 
 - 本期**没有**自动备份、自动归档、自动清理或外部通知。SQLite、文件缓存和日志的备份与保留由系统所有者手动负责。
 - 建议在升级或迁移前，停止对应 crontab 行后，手动复制 `backend/data/`、`backend/cache/`、`.env`（安全位置）和反向代理配置；恢复时停止服务与 crontab、还原这些文件、重新运行 `python manage.py check` 后再启动。

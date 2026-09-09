@@ -689,7 +689,7 @@ python manage.py build_hundred_day --date YYYY-MM-DD
 - `init_stock_daily_prices --years 1` 仅用于首次部署且公共日行情为空时的手动一次性初始化；它不得由 Web API、日常 crontab 或其他管理命令间接调用。
 - `sync_stock_daily_prices --date YYYY-MM-DD` 是日常 crontab 命令，仅下载、校验并幂等写入该交易日；不得扩展为最近一年范围同步。
 - 其他公共数据和盘后分析命令支持 `--date` 或明确日期范围；盘中资金流命令保留无参数交易时段模式和 `--latest` 模式。
-- 截至 **2026 年 9 月 8 日**，开盘啦与东方财富资金流 URL 尚未获得经实际请求验证的历史快照时间参数支持：开盘啦的历史请求需要可用 DeviceID，而当前项目未配置；东方财富请求被当前运行环境代理拒绝。旧 `fundflow` 参考实现也未向这两类资金流请求传递历史日期。因此当前资金流命令不得声明或实现 `--snapshot-time`、`--date` 等显式历史时间参数；未来只有在配置完成并以真实请求确认上游契约后，才可另行扩展。
+- 截至 **2026 年 9 月 9 日**，开盘啦与东方财富资金流 URL 仍未获得经实际请求验证的历史快照时间参数支持；旧 `fundflow` 参考实现也未向这两类资金流请求传递历史日期。因此当前资金流命令不得声明或实现 `--snapshot-time`、`--date` 等显式历史时间参数；未来只有在以真实请求确认上游契约后，才可另行扩展。开盘啦的 `KPL_DEVICE_ID`、`KPL_USER_ID`、`KPL_TOKEN` 均为可选请求字段：空值必须省略，非空值才附带。
 - 所有命令支持 `--dry-run`，且不得写数据库或缓存。
 - 参数无效、上游失败、完整性失败或数据库写入失败时返回非零退出码。
 - 日志包含模块、数据集、业务日期、批次 ID 和耗时，不输出密钥、Token、Device ID 或完整敏感上游响应。
@@ -707,7 +707,7 @@ python manage.py build_hundred_day --date YYYY-MM-DD
 - 时区，固定默认 `Asia/Shanghai`。
 - 模块启用开关。
 - 同花顺 REST API 的 `HITHINK_FINANCE_API_KEY`、超时、低并发、请求间隔和有限重试参数。
-- 开盘啦 URL、请求参数、超时、重试、`KPL_DEVICE_ID`、可选 `KPL_USER_ID` 和 `KPL_TOKEN`。
+- 开盘啦的两条独立 URL：板块资金流使用 `KAIPANLA_API_URL`（实时 `apphwshhq`），行业—股票快照使用 `KAIPANLA_INDUSTRY_API_URL`（历史 `apphis`）；两者各自的请求参数、超时、重试以及可选的 `KPL_DEVICE_ID`、`KPL_USER_ID`、`KPL_TOKEN` 均从 `.env` 读取；空凭据配置不发送对应字段。
 - 东方财富 URL、请求参数、超时、重试和榜单间隔。
 - Web 轻量修复时间、数据量和远程尝试次数预算。
 
@@ -939,7 +939,7 @@ git diff --check
 - **AC-CORE-003**：三个盘后业务 App 不保存公共日行情的完整复制表。
 - **AC-CORE-004**：交易日判断由 `core` 统一提供，业务 App 不包含独立节假日算法。
 - **AC-CORE-005**：行业—股票快照只表示当前开盘啦关系，不包含历史有效期，且仅含 `industry_code`、`industry_name`、`industry_level`（`parent`/`child`）和 `stock_codes`（JSON 数组）四个业务字段。
-- **AC-CORE-006**：同步以开盘啦父行业、子行业和子行业股票接口的实际响应确定层级；父行业 `stock_codes` 必须由下属子行业股票去重汇总；同一股票可出现在多个父行业的 `stock_codes` 中；`child` 记录只持久化，不对外返回。
+- **AC-CORE-006**：同步以开盘啦父行业、子行业和子行业股票接口的实际响应确定层级；父行业 `stock_codes` 必须由下属子行业股票去重汇总；同一股票可出现在多个父行业的 `stock_codes` 中；无成分股的子行业必须以空 `stock_codes` 持久化，不得阻断完整快照发布；`child` 记录只持久化，不对外返回。
 - **AC-CORE-007**：公共数据写入中途失败时，最近成功版本仍可查询，新批次不被标记为完整。
 - **AC-CORE-008**：公共数据版本记录预期数、实际数、缺失数和完整性状态。
 
@@ -947,11 +947,11 @@ git diff --check
 
 - **AC-SRC-000**：同花顺市场数据客户端只访问已批准的 REST 端点：`/api/meta/tickers/list`、`/api/a-share/calendar/trading-days` 和 `/api/a-share/prices/historical`；请求使用 `X-api-key`，密钥仅从根目录 `.env` 的 `HITHINK_FINANCE_API_KEY` 读取。
 - **AC-SRC-000A**：日线同步先分页取得 A 股股票表，再逐股票请求最近一年 `interval=1d`、`adjust=forward` 历史数据；客户端具有可配置低并发、请求间隔和有限退避。
-- **AC-SRC-000B**：行业—股票同步只按开盘啦父行业 → 子行业 → 子行业股票列表链路执行；端点、参数、分页、超时、重试与凭据均从 `.env` 读取。
+- **AC-SRC-000B**：行业—股票同步只按开盘啦父行业 → 子行业 → 子行业股票列表链路执行；端点、参数、分页、超时、重试与可选 `KPL_*` 凭据均从 `.env` 读取。三项凭据任何一项为空时，请求不得发送该字段。
 
 - **AC-SRC-001**：代码扫描和测试证明个股数据路径不包含上交所/深交所下载、Baostock、个股爬虫或浏览器自动化；同花顺 REST HTTP 只允许存在于 `core` 的受控适配层。
 - **AC-SRC-002**：同花顺凭据和配置只从根目录 `.env` 读取，仓库中没有真实值。
-- **AC-SRC-003**：开盘啦使用批准的板块资金流以及行业—股票 URL、分页参数和凭据规则，所有可变值来自 `.env`。
+- **AC-SRC-003**：开盘啦使用批准的板块资金流以及行业—股票 URL、分页参数和凭据规则，所有可变值来自 `.env`；`KPL_DEVICE_ID`、`KPL_USER_ID`、`KPL_TOKEN` 非空时附带，空值时省略。
 - **AC-SRC-004**：东方财富使用批准的板块资金流 URL、双榜参数和等待/重试规则，所有可变值来自 `.env`。
 - **AC-SRC-005**：日志和 API 响应不包含 API Key、Token、Device ID 或完整敏感请求参数。
 - **AC-SRC-006**：模拟上游限流时，系统最多执行配置允许的有限尝试，并返回旧数据或稳定错误。

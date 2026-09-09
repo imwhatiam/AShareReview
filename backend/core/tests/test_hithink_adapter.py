@@ -147,6 +147,36 @@ class HithinkAdapterTests(SimpleTestCase):
             'offset': 0,
         })
 
+    def test_get_historical_prices_accepts_integral_float_volume_from_upstream(self):
+        from core.integrations.hithink.client import HithinkClient
+
+        transport = RecordingTransport([
+            FakeResponse(200, {
+                'code': 0,
+                'data': {
+                    'item': [{
+                        'date_ms': 1788796800000,
+                        'open_price': 10.1,
+                        'high_price': 10.3,
+                        'low_price': 10.0,
+                        'close_price': 10.2,
+                        'volume': 1000.0,
+                        'turnover': 10200.5,
+                    }],
+                },
+            }),
+        ])
+
+        with patch.dict('os.environ', self.settings, clear=False):
+            prices = HithinkClient(transport=transport).get_historical_prices(
+                '000001.SZ',
+                start_date=date(2026, 9, 8),
+                end_date=date(2026, 9, 8),
+            )
+
+        self.assertEqual(prices[0].volume, 1000)
+
+
     def test_missing_required_ticker_field_is_rejected(self):
         from core.integrations.hithink.client import HithinkClient
         from core.integrations.hithink.contracts import HithinkPayloadError

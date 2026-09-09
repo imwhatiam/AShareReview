@@ -68,7 +68,7 @@ def flow_client_settings() -> KaipanlaSectorFundFlowClientSettings:
         raise ImproperlyConfigured('KAIPANLA_FLOW_PAGE_SIZE must not exceed 80.')
     return KaipanlaSectorFundFlowClientSettings(
         endpoint=get_required_setting('KAIPANLA_API_URL'),
-        device_id=get_required_setting('KPL_DEVICE_ID'),
+        device_id=get_setting('KPL_DEVICE_ID', '') or '',
         user_id=get_setting('KPL_USER_ID', '') or '',
         token=get_setting('KPL_TOKEN', '') or '',
         version=get_required_setting('KPL_VERSION'),
@@ -131,8 +131,9 @@ class KaipanlaSectorFundFlowClient:
             'Type': self.settings.ranking_type,
             'ZSType': self.settings.zs_type,
             'Index': str(offset),
-            'DeviceID': self.settings.device_id,
         }
+        if self.settings.device_id:
+            data['DeviceID'] = self.settings.device_id
         if self.settings.user_id:
             data['UserID'] = self.settings.user_id
         if self.settings.token:

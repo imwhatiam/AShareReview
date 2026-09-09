@@ -1,0 +1,121 @@
+@import './styles/tokens.css';
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-width: 20rem;
+  margin: 0;
+  background: var(--color-page);
+  color: var(--color-text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+.data-state,
+.data-meta {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.data-state {
+  padding: var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+}
+
+.data-state--error {
+  border-color: var(--color-error);
+  color: var(--color-error);
+}
+
+.data-meta {
+  color: var(--color-muted);
+  font-size: 0.875rem;
+}
+
+.data-meta__stale,
+.data-meta__partial {
+  color: var(--color-warning);
+}
+
+#root {
+  min-height: 100vh;
+}
+
+header,
+main {
+  width: min(100%, 75rem);
+  margin: 0 auto;
+  padding: var(--space-4);
+}
+
+header {
+  display: grid;
+  gap: var(--space-3);
+}
+
+main {
+  display: grid;
+  gap: var(--space-3);
+}
+
+[role="tablist"] {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+button,
+input {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+  color: inherit;
+  padding: var(--space-2) var(--space-3);
+}
+
+[role="tab"] {
+  border-bottom-width: 3px;
+}
+
+[role="tab"][aria-selected="true"] {
+  border-color: var(--color-market-up);
+  border-bottom-color: var(--color-market-up);
+  font-weight: 700;
+}
+
+button:focus-visible,
+input:focus-visible {
+  outline: 3px solid var(--color-warning);
+  outline-offset: 2px;
+}
+
+.data-state {
+  min-width: 0;
+  overflow-x: auto;
+}
+
+@media (max-width: 40rem) {
+  header,
+  main {
+    padding: var(--space-3);
+  }
+
+  [role="tablist"] {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding-bottom: var(--space-1);
+  }
+
+  [role="tab"] {
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+}

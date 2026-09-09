@@ -7,7 +7,24 @@ class CoreAppBootstrapTests(SimpleTestCase):
         response = self.client.get('/api/core/health/')
 
         self.assertEqual(response.status_code, 200)
-        self.assertJSONEqual(response.content, {'status': 'ok'})
+        self.assertJSONEqual(
+            response.content,
+            {
+                'status': 'ok',
+                'business_date': None,
+                'data_version': None,
+                'stale': False,
+                'source': 'application',
+                'preparation': {
+                    'state': 'ready',
+                    'retry_after_seconds': None,
+                },
+                'warnings': [],
+                'error': None,
+                'data': {'healthy': True},
+                'generated_at': response.json()['generated_at'],
+            },
+        )
 
     def test_unknown_api_path_returns_not_found(self):
         response = self.client.get('/api/not-a-module/')

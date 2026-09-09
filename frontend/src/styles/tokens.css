@@ -1,0 +1,16 @@
+:root {
+  --color-page: #f5f7fa;
+  --color-surface: #ffffff;
+  --color-text: #1f2937;
+  --color-muted: #667085;
+  --color-border: #d0d5dd;
+  --color-market-up: #c62828;
+  --color-market-down: #008a4c;
+  --color-error: #b42318;
+  --color-warning: #8a5b00;
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --radius: 0.5rem;
+}

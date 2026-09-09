@@ -18,6 +18,7 @@ from backend.env import (
     get_bool_setting,
     get_list_setting,
     get_path_setting,
+    get_setting,
     get_required_setting,
 )
 
@@ -35,6 +36,7 @@ SECRET_KEY = get_required_setting('DJANGO_SECRET_KEY')
 DEBUG = get_bool_setting('DJANGO_DEBUG', default=False)
 
 ALLOWED_HOSTS = get_list_setting('DJANGO_ALLOWED_HOSTS')
+DATA_COMMAND_LOG_LEVEL = (get_setting('DATA_COMMAND_LOG_LEVEL', 'INFO') or 'INFO').upper()
 
 
 # Application definition
@@ -110,6 +112,39 @@ DATABASES = {
     },
 }
 DATABASE_ROUTERS = ['backend.db_router.AppDatabaseRouter']
+
+
+SESSION_COOKIE_SECURE = get_bool_setting('SESSION_COOKIE_SECURE', default=True)
+SESSION_COOKIE_HTTPONLY = get_bool_setting('SESSION_COOKIE_HTTPONLY', default=True)
+SESSION_COOKIE_SAMESITE = get_setting('SESSION_COOKIE_SAMESITE', 'Lax')
+CSRF_COOKIE_SECURE = get_bool_setting('CSRF_COOKIE_SECURE', default=True)
+CSRF_COOKIE_SAMESITE = get_setting('CSRF_COOKIE_SAMESITE', 'Lax')
+CSRF_TRUSTED_ORIGINS = get_list_setting('CSRF_TRUSTED_ORIGINS')
+CSRF_FAILURE_VIEW = 'core.views.csrf_failure'
+
+
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'standard': {
+            'format': '%(asctime)s %(levelname)s %(name)s %(message)s',
+        },
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'standard',
+        },
+    },
+    'loggers': {
+        'core.management': {
+            'handlers': ['console'],
+            'level': DATA_COMMAND_LOG_LEVEL,
+            'propagate': False,
+        },
+    },
+}
 
 
 # Password validation

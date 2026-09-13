@@ -1,19 +1,21 @@
 """Fetch and publish one complete Kaipanla sector fund-flow snapshot."""
 
-from datetime import datetime, time
+from datetime import time
 from zoneinfo import ZoneInfo
 
-from django.core.management.base import CommandError
 from django.utils import timezone
 
 from core.management.base import BaseDataCommand
+from core.logging import log_command_progress
 from core.models import TradingDay
 from core.services.file_cache import default_file_cache
-from core.services.publication import begin_publication, fail_publication, finish_publication
+from core.services.publication import begin_publication, publish_with_writer
 from core.services.run_status import mark_failed
 from kaipanla.services.fetcher import KaipanlaSectorFundFlowFetcher
+from kaipanla.services.intraday import resolve_snapshot_slot
 from kaipanla.services.writer import (
     IncompleteKaipanlaSnapshot,
+    KaipanlaSnapshotWriteResult,
     new_source_batch_id,
     record_incomplete_snapshot,
     write_complete_snapshot,
@@ -33,7 +35,7 @@ class Command(BaseDataCommand):
         parser.add_argument(
             '--latest',
             action='store_true',
-            help='Fetch the latest upstream snapshot outside normal trading hours.',
+            help='Allow a run outside the trading sessions (midday break, after the close, non-trading day).',
         )
 
     def run_data_sync(self, options):
@@ -41,8 +43,18 @@ class Command(BaseDataCommand):
         if not options['latest'] and not self._is_trading_session(now):
             raise ValueError('The default mode is only available during an A-share trading session.')
 
+        log_command_progress('kaipanla_sector_fund_flow', action='fetching')
         fetch_result = KaipanlaSectorFundFlowFetcher().fetch()
-        snapshot_time = self._snapshot_time(fetch_result, now, latest=options['latest'])
+        log_command_progress(
+            'kaipanla_sector_fund_flow',
+            action='fetched',
+            is_complete=fetch_result.is_complete,
+            records=len(fetch_result.rows),
+            pages=f'{fetch_result.completed_page_count}/{fetch_result.expected_page_count}',
+        )
+        # 快照归属由运行时刻决定：盘中回退到所在 5 分钟槽，午休回退到 11:30，
+        # 收盘后落在 15:00，非交易日/开盘前落在最近一个交易日的 15:00。
+        snapshot_time = resolve_snapshot_slot(now)
         if options['dry_run']:
             if not fetch_result.is_complete or not fetch_result.rows:
                 raise IncompleteKaipanlaSnapshot(
@@ -73,16 +85,32 @@ class Command(BaseDataCommand):
             snapshot_time.date(),
             len(fetch_result.rows),
         )
-        try:
+        log_command_progress(
+            'kaipanla_sector_fund_flow',
+            action='writing',
+            snapshot_time=snapshot_time,
+            records=len(fetch_result.rows),
+        )
+        # 写行与发布版本交给 publish_with_writer：失败路径只有一处（写失败 ⇒ 版本
+        # 标 failed），而且行上会盖上本批次的版本号，读路径只认已发布版本的行 ——
+        # 于是"行已落库但版本还没标 complete"这个崩溃窗口里的数据永远不会被返回。
+        write_result: KaipanlaSnapshotWriteResult | None = None
+
+        def write_rows() -> None:
+            nonlocal write_result
             write_result = write_complete_snapshot(
                 fetch_result=fetch_result,
                 snapshot_time=snapshot_time,
                 source_batch_id=source_batch_id,
+                source_data_version=publication.version,
             )
-            finish_publication(publication, write_result.record_count, 0)
-        except Exception as error:
-            fail_publication(publication, error)
-            raise
+
+        publish_with_writer(
+            publication,
+            write_rows,
+            actual_record_count=len(fetch_result.rows),
+            missing_record_count=0,
+        )
 
         cache = default_file_cache()
         if cache is not None:
@@ -102,16 +130,3 @@ class Command(BaseDataCommand):
             return False
         current_time = now.time()
         return time(9, 30) <= current_time <= time(11, 30) or time(13, 0) <= current_time <= time(15, 0)
-
-    @staticmethod
-    def _snapshot_time(fetch_result, now, *, latest: bool):
-        if not latest:
-            return now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
-        try:
-            raw_timestamp = int(fetch_result.source_timestamp)
-        except (TypeError, ValueError) as error:
-            raise ValueError('Kaipanla latest mode requires an upstream snapshot timestamp.') from error
-        if raw_timestamp > 10**11:
-            raw_timestamp //= 1000
-        source_time = datetime.fromtimestamp(raw_timestamp, SHANGHAI_TIME_ZONE)
-        return source_time.replace(minute=(source_time.minute // 5) * 5, second=0, microsecond=0)

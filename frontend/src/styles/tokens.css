@@ -1,16 +1,121 @@
+/*
+ * 设计令牌（Design Tokens）
+ * 全站唯一的颜色 / 间距 / 圆角 / 阴影 / 字体来源，任何组件样式都只允许引用这里的变量。
+ *
+ * 配色原则：界面外壳（导航、按钮、卡片）使用中性 + 蓝色系；
+ * 红 / 绿 仅用于数据语义（A 股惯例：红涨绿跌），避免与操作色混淆。
+ *
+ * 增删约定（2026-09-12）：
+ * 1. **阶梯型令牌**（brand/ink 色阶、space/text/shadow 刻度、sans/mono 字族对）
+ *    允许先于使用存在，它们是成套的刻度，删一格反而会让后续取值无处可放。
+ * 2. **单用途语义令牌**（info/overlay/ring-*、--chart-*）必须与它的消费点同生共死：
+ *    消费点被删后留着，会让"改了令牌却毫无效果"这种错觉有处可藏。
+ * 3. **图表颜色不在这里**：四个 ECharts 组件的调色板唯一定义在
+ *    `src/shared/charts/chartTheme.js` 的 `CHART`（纯 JS 常量，图表不读 CSS 变量）。
+ *    其中有几个值与这里的 `--color-market-up/down` 相同，改动任一侧都必须手工同步另一侧。
+ */
+
 :root {
-  --color-page: #f5f7fa;
+  color-scheme: light;
+
+  /* ── 品牌色：冷静的数据分析蓝 ───────────────────────────── */
+  --color-brand-50: #eef3ff;
+  --color-brand-100: #dbe5ff;
+  --color-brand-200: #bfd0ff;
+  --color-brand-300: #93aeff;
+  --color-brand-400: #5c85f2;
+  --color-brand-500: #3760e6;
+  --color-brand-600: #234cc9;
+  --color-brand-700: #1c3da3;
+  --color-brand-800: #173182;
+
+  /* ── 中性色 ───────────────────────────────────────────── */
+  --color-ink-900: #0f1729;
+  --color-ink-800: #1a2438;
+  --color-ink-700: #2f3d55;
+  --color-ink-600: #46556f;
+  --color-ink-500: #5c6b85;
+  --color-ink-400: #8492a9;
+  --color-ink-300: #a8b3c5;
+  --color-ink-200: #c8d0de;
+
+  /* ── 页面与表面 ───────────────────────────────────────── */
+  --color-page: #f4f6fb;
+  --color-page-glow: #e8eeff;
   --color-surface: #ffffff;
-  --color-text: #1f2937;
-  --color-muted: #667085;
-  --color-border: #d0d5dd;
-  --color-market-up: #c62828;
-  --color-market-down: #008a4c;
-  --color-error: #b42318;
-  --color-warning: #8a5b00;
+  --color-surface-muted: #f8fafd;
+  --color-surface-sunken: #f1f4fa;
+
+  /* ── 描边 ─────────────────────────────────────────────── */
+  --color-border: #e2e7f0;
+  --color-border-strong: #cdd6e5;
+
+  /* ── 语义文本别名（保留历史变量名） ───────────────────── */
+  --color-text: var(--color-ink-900);
+  --color-muted: var(--color-ink-500);
+
+  /* ── 涨跌语义：红涨绿跌（A 股惯例，不可交换） ─────────── */
+  --color-market-up: #cf2c2d;
+  --color-market-down: #0d8f57;
+  --color-market-up-soft: #fdecec;
+  --color-market-down-soft: #e5f6ee;
+
+  /* ── 状态语义 ─────────────────────────────────────────── */
+  --color-error: #c2261d;
+  --color-error-soft: #fdeceb;
+  --color-warning: #a2620b;
+  --color-warning-soft: #fdf3e4;
+  --color-success: #0d7f4f;
+  --color-success-soft: #e6f6ee;
+
+  /* ── 间距刻度 ─────────────────────────────────────────── */
   --space-1: 0.25rem;
   --space-2: 0.5rem;
   --space-3: 0.75rem;
   --space-4: 1rem;
-  --radius: 0.5rem;
+  --space-5: 1.25rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --space-10: 2.5rem;
+  --space-12: 3rem;
+
+  /* ── 圆角 ─────────────────────────────────────────────── */
+  --radius: 0.625rem;
+  --radius-xs: 0.25rem;
+  --radius-sm: 0.375rem;
+  --radius-md: 0.625rem;
+  --radius-lg: 0.875rem;
+  --radius-xl: 1.125rem;
+  --radius-pill: 999px;
+
+  /* ── 阴影 ─────────────────────────────────────────────── */
+  --shadow-xs: 0 1px 2px rgba(16, 24, 40, 0.04);
+  --shadow-sm: 0 1px 3px rgba(16, 24, 40, 0.06), 0 1px 2px rgba(16, 24, 40, 0.04);
+  --shadow-md: 0 4px 12px rgba(16, 24, 40, 0.08), 0 1px 3px rgba(16, 24, 40, 0.04);
+  --shadow-lg: 0 12px 32px rgba(16, 24, 40, 0.12), 0 2px 8px rgba(16, 24, 40, 0.06);
+  --ring-brand: 0 0 0 3px rgba(55, 96, 230, 0.28);
+
+  /* ── 字体 ─────────────────────────────────────────────── */
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+
+  --text-xs: 0.75rem;
+  --text-sm: 0.8125rem;
+  --text-base: 0.875rem;
+  --text-md: 0.9375rem;
+  --text-lg: 1.0625rem;
+  --text-xl: 1.25rem;
+  --text-2xl: 1.5rem;
+
+  /* ── 动效 ─────────────────────────────────────────────── */
+  --motion-fast: 120ms;
+  --motion-base: 180ms;
+  --ease-out: cubic-bezier(0.22, 0.61, 0.36, 1);
+
+  /* ── 层级 ─────────────────────────────────────────────── */
+  --z-header: 20;
+  --z-tooltip: 60;
+
+  /* 图表配色不在这里 —— 见文件头第 3 条与 `src/shared/charts/chartTheme.js` 的 CHART。 */
 }

@@ -1,6 +1,20 @@
 import { useState } from 'react'
 
-import DataState from '../../shared/DataState'
+import { resolveDataStateName } from '../../shared/dataStateName'
+import { resolveDisplayDate } from '../../shared/businessDate'
+import {
+  formatDecimal,
+  formatRatioPercent,
+  formatTurnoverInYi,
+  stockLabel,
+} from '../../shared/stockFormat'
+import useToggleSet from '../../shared/useToggleSet'
+import DatePicker from '../../shared/ui/DatePicker'
+import ModulePage from '../../shared/ui/ModulePage'
+import Panel from '../../shared/ui/Panel'
+import RankItem from '../../shared/ui/RankItem'
+import RefreshStamp from '../../shared/RefreshStamp'
+import StatRow from '../../shared/ui/StatRow'
 import MomentumChart from './MomentumChart'
 import useSectorMomentum from './useSectorMomentum'
 
@@ -9,91 +23,105 @@ const METRICS = [
   ['top_5_percent', '全市场涨幅前 5%'],
 ]
 
-function percent(value) {
-  return `${(Number(value) * 100).toFixed(2)}%`
-}
+const ERROR_MESSAGE = '板块动量数据暂时无法加载。'
+
+/*
+ * 本页所有数字都走 `stockFormat` 的共享写法（缺失值留破折号）。这里曾经自带一个
+ * 没有 null 守卫的 `percent()`：字段缺失时显示 `NaN%`，而同样的比率在百日页显示
+ * `—` —— 同一份后端契约在两个页面上有两种呈现。
+ */
 
 function MetricSection({ metric, title, rankings, expanded, onToggle }) {
   return (
-    <section aria-label={title}>
-      <h2>{title}</h2>
-      {rankings.length === 0 ? <p>暂无行业排行</p> : <>
-        <MomentumChart rankings={rankings} />
-        <ol>
-          {rankings.map((item) => {
-            const key = `${metric}:${item.industry_code}`
-            const isExpanded = expanded.has(key)
-            return (
-              <li key={key}>
-                <h3>{item.rank}. {item.industry_name}（评分：{Number(item.score).toFixed(4)}）</h3>
-                <p>股票数：{item.stock_count}；平均涨幅：{Number(item.average_change_percent).toFixed(2)}%；成交额占比：{percent(item.market_turnover_ratio)}</p>
-                <button type="button" onClick={() => onToggle(key)}>
-                  {isExpanded ? '收起股票明细' : '展开股票明细'}
-                </button>
-                {isExpanded && (
-                  <ul aria-label={`${item.industry_name}股票明细`}>
-                    {(item.stocks ?? []).map((stock) => (
-                      <li key={stock.code}>{stock.code} {stock.name}：{Number(stock.change_percent).toFixed(2)}%，{(Number(stock.turnover) / 1e8).toFixed(2)} 亿元</li>
-                    ))}
-                  </ul>
-                )}
-              </li>
-            )
-          })}
-        </ol>
-      </>}
-    </section>
+    <Panel title={title} icon="pulse">
+      {rankings.length === 0 ? (
+        <p className="empty-note">暂无行业排行</p>
+      ) : (
+        <div className="module-stack">
+          <div className="chart-frame">
+            <MomentumChart rankings={rankings} />
+          </div>
+          <ol className="rank-list">
+            {rankings.map((item) => {
+              const key = `${metric}:${item.industry_code}`
+              return (
+                <RankItem
+                  key={key}
+                  index={item.rank}
+                  title={`${item.industry_name}（评分：${formatDecimal(item.score, 4)}）`}
+                  facts={(
+                    <>
+                      <span>股票数：{item.stock_count}</span>
+                      <span>平均涨幅：{formatDecimal(item.average_change_percent)}%</span>
+                      <span>成交额占比：{formatRatioPercent(item.market_turnover_ratio)}</span>
+                    </>
+                  )}
+                  expanded={expanded.has(key)}
+                  onToggle={() => onToggle(key)}
+                  detailLabel={`${item.industry_name}股票明细`}
+                >
+                  {(item.stocks ?? []).map((stock) => (
+                    <li key={stock.code} className="stock-detail__item">
+                      {stockLabel(stock)}
+                    </li>
+                  ))}
+                </RankItem>
+              )
+            })}
+          </ol>
+        </div>
+      )}
+    </Panel>
   )
 }
 
 export default function SectorMomentumPage({ apiClient }) {
   const [date, setDate] = useState('')
-  const [expanded, setExpanded] = useState(new Set())
-  const { phase, envelope } = useSectorMomentum({ apiClient, date })
+  const { values: expanded, toggle: toggleExpanded } = useToggleSet()
+  const { phase, envelope, refreshedAt } = useSectorMomentum({ apiClient, date })
 
-  function toggleExpanded(key) {
-    setExpanded((previous) => {
-      const next = new Set(previous)
-      if (next.has(key)) next.delete(key)
-      else next.add(key)
-      return next
-    })
-  }
-
-  if (phase === 'loading') return <DataState state="loading" />
-  if (phase === 'error') return <DataState state="error" message="板块动量数据暂时无法加载。" />
-  if (envelope?.error?.code === 'DATA_PREPARING') return <DataState state="preparing" />
-  if (envelope?.error?.code === 'DATA_NOT_AVAILABLE' || !envelope?.data) return <DataState state="empty" />
-
-  const unmappedWarning = envelope.data.unmapped_stock_count
-    ? `${envelope.data.unmapped_stock_count} 只有效股票未映射到开盘啦父行业。`
-    : null
-  const warnings = envelope.warnings?.length ? envelope.warnings : (unmappedWarning ? [unmappedWarning] : [])
+  /*
+   * 本页不展示告警列表：后端唯一会发的告警是「N 只有效股票未映射到开盘啦板块」，
+   * 那是上游行业映射的覆盖度说明，用户无法处理且每次都会出现；未映射数量仍在
+   * envelope.data.unmapped_stock_count 里，需要时可以查。旧数据提示（stale）保留。
+   * 之前这里还按 unmapped_stock_count 再拼一条同样的文案，与后端告警重复，已删除。
+   */
+  const data = envelope?.data ?? null
+  const stateName = resolveDataStateName(phase, envelope, { hasContent: Boolean(data) })
+  const displayDate = resolveDisplayDate(date, envelope)
 
   return (
-    <DataState
-      businessDate={envelope.business_date}
-      dataVersion={envelope.data_version}
-      stale={envelope.stale}
-      partial={envelope.status === 'partial'}
-      warnings={warnings}
+    <ModulePage
+      envelope={envelope}
+      stateName={stateName}
+      message={stateName === 'error' ? ERROR_MESSAGE : undefined}
+      showWarnings={false}
+      toolbar={(
+        <>
+          <DatePicker id="sector-momentum-date" value={displayDate} onChange={setDate} />
+          <RefreshStamp refreshedAt={refreshedAt} />
+          {/* 成交额依赖数据，没数据时整组不渲染。 */}
+          {data && (
+            <div className="stat-grid">
+              <StatRow>全市场成交额：{formatTurnoverInYi(data.total_market_turnover)} 亿元</StatRow>
+            </div>
+          )}
+        </>
+      )}
     >
-      <section aria-label="板块动量">
-        <h1>板块动量</h1>
-        <label htmlFor="sector-momentum-date">数据日期</label>
-        <input id="sector-momentum-date" type="date" value={date} onChange={(event) => setDate(event.target.value)} />
-        <p>全市场成交额：{(Number(envelope.data.total_market_turnover) / 1e8).toFixed(2)} 亿元</p>
+      {/* 两个口径并排一行，方便左右对照同一批行业。 */}
+      <div className="pair-grid">
         {METRICS.map(([metric, title]) => (
           <MetricSection
             key={metric}
             metric={metric}
             title={title}
-            rankings={envelope.data.rankings?.[metric] ?? []}
+            rankings={data?.rankings?.[metric] ?? []}
             expanded={expanded}
             onToggle={toggleExpanded}
           />
         ))}
-      </section>
-    </DataState>
+      </div>
+    </ModulePage>
   )
 }

@@ -1,18 +1,24 @@
-"""Cache-first reads and bounded local rebuilds for hundred-day results."""
+"""Cache-first reads and on-demand local generation for hundred-day results.
 
-from dataclasses import dataclass
+The cache/version/fallback sequence itself lives in ``core.services.read_path``;
+this module only declares what is genuinely hundred-day's: how to generate a
+day, how to serialize it, and what to warn about. ``InsufficientHundredDayHistory``
+is registered as an "unavailable" error so a page request can be answered with a
+specific reason instead of a generic failure.
+"""
+
 from datetime import date
 from decimal import Decimal
 
-from backend.env import get_required_setting
-from core.models import DataVersion
-from core.services.cache_keys import build_cache_key
-from core.services.file_cache import CachePayloadTooLarge, default_file_cache
+from core.services.file_cache import default_file_cache
+from core.services.locking import DatasetBusy, DatasetLocked, dataset_lock
 from core.services.market_data import (
-    STOCK_DAILY_PRICES_DATASET,
     CompleteMarketDataUnavailable,
     latest_complete_stock_price_date,
 )
+from core.services.read_path import ReadPath, ReadResult  # noqa: F401
+from core.services.read_path import read as _read
+from core.services.read_path import read_dates as _read_dates
 from hundred_day.models import HundredDayResult
 from hundred_day.services.analysis import (
     InsufficientHundredDayHistory,
@@ -25,86 +31,35 @@ from hundred_day.services.source_versions import (
 )
 from hundred_day.services.writer import write_hundred_day_analysis
 
-
-@dataclass(frozen=True)
-class ReadResult:
-    data: dict
-    business_date: date
-    data_version: str
-    source: str
-    stale: bool = False
-    warnings: tuple[str, ...] = ()
+MODULE_ID = 'hundred_day'
+DATASET_KEY = 'hundred_day'
 
 
-def _max_local_repair_rows() -> int:
+def _local_generate(business_date: date) -> HundredDayResult:
+    """Generate the hundred-day flags from already-local rows only.
+
+    This path never contacts upstream APIs. It is the heaviest of the three
+    on-demand generations because it reads roughly 199 trading days of local
+    closes, so the dataset lock keeps a concurrent request or a running
+    ``build_hundred_day`` command from doing the same work twice.
+    """
     try:
-        value = int(get_required_setting('REMOTE_REPAIR_MAX_ROWS'))
-    except ValueError as error:
-        raise ValueError('REMOTE_REPAIR_MAX_ROWS must be an integer.') from error
-    if value < 1:
-        raise ValueError('REMOTE_REPAIR_MAX_ROWS must be positive.')
-    return value
-
-
-def _latest_daily_price_version(business_date: date) -> str | None:
-    version = DataVersion.objects.filter(
-        dataset_key=STOCK_DAILY_PRICES_DATASET,
-        business_date=business_date,
-        status=DataVersion.Status.COMPLETE,
-    ).order_by('-last_success_at', '-started_at').first()
-    return version.version if version is not None else None
-
-
-def _current_source_versions(business_date: date) -> tuple[str | None, str | None]:
-    daily_price_version = _latest_daily_price_version(business_date)
-    try:
-        industry_version = get_complete_industry_snapshot_version()
-    except CompleteIndustrySnapshotUnavailable:
-        industry_version = None
-    return daily_price_version, industry_version
-
-
-def _result_for_date(business_date: date) -> tuple[HundredDayResult | None, bool]:
-    daily_price_version, industry_version = _current_source_versions(business_date)
-    results = HundredDayResult.objects.using('hundred_day').filter(business_date=business_date)
-    if daily_price_version is not None and industry_version is not None:
-        result = results.filter(
-            source_daily_price_version=daily_price_version,
-            source_industry_version=industry_version,
-        ).order_by('-created_at').first()
-        if result is not None:
-            return result, False
-
-    result = results.order_by('-created_at').first()
-    stale = bool(result and (
-        (daily_price_version is not None and result.source_daily_price_version != daily_price_version)
-        or (industry_version is not None and result.source_industry_version != industry_version)
-    ))
-    return result, stale
-
-
-def _source_row_count(source) -> int:
-    return sum(len(closes) for closes in source.close_prices_by_stock.values())
-
-
-def _bounded_local_rebuild(business_date: date) -> HundredDayResult:
-    """Rebuild from already-local rows only; this function never contacts upstream APIs."""
-    source = load_hundred_day_source_data(business_date)
-    if _source_row_count(source) > _max_local_repair_rows():
-        raise CompleteMarketDataUnavailable(
-            'The local public history exceeds the web-request rebuild budget.'
-        )
-    try:
-        industry_version = get_complete_industry_snapshot_version()
-    except CompleteIndustrySnapshotUnavailable as error:
-        raise CompleteMarketDataUnavailable(str(error)) from error
-    analysis = build_hundred_day_analysis(source, source_industry_version=industry_version)
-    write_result = write_hundred_day_analysis(analysis=analysis)
+        with dataset_lock(MODULE_ID, DATASET_KEY):
+            source = load_hundred_day_source_data(business_date)
+            try:
+                industry_version = get_complete_industry_snapshot_version()
+            except CompleteIndustrySnapshotUnavailable as error:
+                raise CompleteMarketDataUnavailable(str(error)) from error
+            analysis = build_hundred_day_analysis(
+                source, source_industry_version=industry_version
+            )
+            write_result = write_hundred_day_analysis(analysis=analysis)
+    except DatasetLocked as error:
+        # 锁被占用不是"数据不可用"：调用方据此决定是返回旧数据还是 409。
+        raise DatasetBusy(
+            f'The hundred-day analysis for {business_date.isoformat()} is being generated.'
+        ) from error
     return HundredDayResult.objects.using('hundred_day').get(pk=write_result.result_id)
-
-
-def _data_version(result: HundredDayResult) -> str:
-    return f'{result.source_daily_price_version}:{result.source_industry_version}'
 
 
 def _ratio(count: int, total: int) -> str | None:
@@ -137,7 +92,7 @@ def _serialize(result: HundredDayResult) -> dict:
             {
                 'code': flag.stock_code,
                 'name': flag.stock_name,
-                'parent_industries': flag.parent_industries,
+                'industries': flag.industries,
                 'is_new_high': flag.is_new_high,
                 'is_new_low': flag.is_new_low,
             }
@@ -157,95 +112,37 @@ def _serialize(result: HundredDayResult) -> dict:
     }
 
 
-def _warnings(stale: bool) -> tuple[str, ...]:
+def _warnings(_result: HundredDayResult, stale: bool) -> tuple[str, ...]:
     return (
         ('公共日行情或行业映射版本已更新，正在展示最近可用的百日分析结果。',)
         if stale else ()
     )
 
 
+READ_PATH = ReadPath(
+    module_id=MODULE_ID,
+    results=lambda: HundredDayResult.objects.using('hundred_day'),
+    generate=_local_generate,
+    serialize=_serialize,
+    warnings=_warnings,
+    latest_public_date=lambda: latest_complete_stock_price_date(),
+    industry_version=lambda: get_complete_industry_snapshot_version(),
+    industry_unavailable=CompleteIndustrySnapshotUnavailable,
+    file_cache=lambda: default_file_cache(),
+    unavailable_errors=(InsufficientHundredDayHistory,),
+    no_result_message='No hundred-day analysis result is available.',
+)
+
+
 def read_hundred_day(trade_date: date | None = None) -> ReadResult:
-    """Read cache, SQLite or an explicitly bounded local rebuild, in that order."""
-    if trade_date is None:
-        result = HundredDayResult.objects.using('hundred_day').order_by(
-            '-business_date', '-created_at'
-        ).first()
-        if result is None:
-            trade_date = latest_complete_stock_price_date()
-            if trade_date is None:
-                raise CompleteMarketDataUnavailable('No complete public daily-price data is available.')
-            result = _bounded_local_rebuild(trade_date)
-            stale = False
-            source = 'computed'
-        else:
-            trade_date = result.business_date
-            current, stale = _result_for_date(trade_date)
-            if current is not None:
-                result = current
-            if stale:
-                try:
-                    result = _bounded_local_rebuild(trade_date)
-                    stale = False
-                    source = 'computed'
-                except (CompleteMarketDataUnavailable, InsufficientHundredDayHistory):
-                    source = 'database'
-            else:
-                source = 'database'
-    else:
-        result, stale = _result_for_date(trade_date)
-        source = 'database'
-        if result is None or stale:
-            try:
-                result = _bounded_local_rebuild(trade_date)
-                stale = False
-                source = 'computed'
-            except (CompleteMarketDataUnavailable, InsufficientHundredDayHistory):
-                if result is None:
-                    raise
+    """Read the flags, generating them locally when the requested day has none.
 
-    data_version = _data_version(result)
-    cache = default_file_cache()
-    key = build_cache_key('hundred_day', 'result', {'date': str(trade_date)}, data_version)
-    if cache is not None and source != 'computed':
-        cached = cache.get(key, data_version)
-        if cached is not None:
-            return ReadResult(
-                cached, result.business_date, data_version, 'cache', stale, _warnings(stale)
-            )
-
-    data = _serialize(result)
-    if cache is not None:
-        try:
-            cache.set(key, data, data_version)
-        except CachePayloadTooLarge:
-            pass
-    return ReadResult(data, result.business_date, data_version, source, stale, _warnings(stale))
+    Logged like the other two modules; ``insufficient_history`` is its own event
+    because it means "the local price history is too short", not "the day is
+    missing" — an operator fixes those two very differently.
+    """
+    return _read(READ_PATH, trade_date)
 
 
 def read_dates() -> ReadResult:
-    result = HundredDayResult.objects.using('hundred_day').order_by(
-        '-business_date', '-created_at'
-    ).first()
-    if result is None:
-        raise CompleteMarketDataUnavailable('No hundred-day analysis result is available.')
-    data_version = _data_version(result)
-    cache = default_file_cache()
-    key = build_cache_key('hundred_day', 'dates', {}, data_version)
-    if cache is not None:
-        cached = cache.get(key, data_version)
-        if cached is not None:
-            return ReadResult(cached, result.business_date, data_version, 'cache')
-    data = {
-        'dates': [
-            str(value)
-            for value in HundredDayResult.objects.using('hundred_day').order_by(
-                '-business_date'
-            ).values_list('business_date', flat=True).distinct()
-        ]
-    }
-    if cache is not None:
-        try:
-            cache.set(key, data, data_version)
-        except CachePayloadTooLarge:
-            pass
-    return ReadResult(data, result.business_date, data_version, 'database')
+    return _read_dates(READ_PATH)

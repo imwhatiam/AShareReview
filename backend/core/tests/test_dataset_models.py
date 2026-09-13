@@ -39,45 +39,42 @@ class DatasetModelTests(TestCase):
         with self.assertRaises(IntegrityError), transaction.atomic():
             DailyPrice.objects.create(**values)
 
-    def test_data_version_distinguishes_complete_partial_and_failed(self):
+    def test_data_version_round_trips_every_status_and_orders_newest_first(self):
+        """真存真读一遍状态列，并钉住"最新在前"的默认排序。
+
+        这一条以前是"造四个对象，再断言传入的 status 集合 == 枚举集合"——两边同
+        源，恒真、零覆盖。真正值得守的是两件会被静默破坏的事：
+
+        1. ``status`` 列是 ``max_length=8``，而 ``complete`` 正好 8 个字符：再加长
+           或改名就会被数据库静默截断成 ``complete`` 之外的值。
+        2. 读路径用 ``.first()`` / ``.order_by('-last_success_at')`` 取最新版本，
+           ``Meta.ordering`` 是它没写 order_by 时的兜底 —— 反了就会一直读到旧版本。
+        """
+        from datetime import timedelta
+
+        from django.utils import timezone
+
         from core.models import DataVersion
 
-        complete = DataVersion.objects.create(
-            dataset_key='stock_daily_prices',
-            version='prices-20260908-v1',
-            business_date=date(2026, 9, 8),
-            status=DataVersion.Status.COMPLETE,
-            expected_record_count=10,
-            actual_record_count=10,
-            missing_record_count=0,
-        )
-        partial = DataVersion.objects.create(
-            dataset_key='stock_daily_prices',
-            version='prices-20260908-v2',
-            business_date=date(2026, 9, 8),
-            status=DataVersion.Status.PARTIAL,
-            expected_record_count=10,
-            actual_record_count=9,
-            missing_record_count=1,
-        )
-        failed = DataVersion.objects.create(
-            dataset_key='stock_daily_prices',
-            version='prices-20260908-v3',
-            business_date=date(2026, 9, 8),
-            status=DataVersion.Status.FAILED,
-            expected_record_count=10,
-            actual_record_count=0,
-            missing_record_count=10,
-            error_summary='upstream unavailable',
-        )
+        base = timezone.now()
+        for index, status in enumerate(DataVersion.Status.values):
+            version = DataVersion.objects.create(
+                dataset_key='stock_daily_prices',
+                version=f'prices-20260908-v{index}',
+                business_date=date(2026, 9, 8),
+                status=status,
+                expected_record_count=10,
+                actual_record_count=10,
+                error_summary=f'状态 {status} 的备注',
+                started_at=base + timedelta(seconds=index),
+            )
+            version.refresh_from_db()
+            self.assertEqual(version.status, status)
+            self.assertEqual(version.error_summary, f'状态 {status} 的备注')
 
         self.assertEqual(
-            {complete.status, partial.status, failed.status},
-            {
-                DataVersion.Status.COMPLETE,
-                DataVersion.Status.PARTIAL,
-                DataVersion.Status.FAILED,
-            },
+            [row.status for row in DataVersion.objects.all()],
+            list(reversed(DataVersion.Status.values)),
         )
 
     def test_run_status_keeps_a_removed_module_identifier_without_relation(self):

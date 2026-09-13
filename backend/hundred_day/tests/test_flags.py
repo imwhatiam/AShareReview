@@ -1,4 +1,5 @@
 import json
+import random
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -96,3 +97,53 @@ class HundredDayFlagTests(SimpleTestCase):
             [flag.stock_code for flag in result.flags_by_date[dates[-1]]],
             ['600001', '600002'],
         )
+
+    def test_sliding_extrema_match_the_naive_window_on_random_series(self):
+        """The deque optimisation must stay bit-for-bit equivalent to the plain window.
+
+        The naive form (build one tuple per stock per trading day, then max/min) is
+        the original implementation and is cheap enough for a small random sample,
+        so it is kept here as the differential oracle for the fast path.
+        """
+        random_source = random.Random(20260908)
+        positions = 130
+        stock_count = 24
+        series: dict[str, list] = {}
+        for index in range(stock_count):
+            series[f'{600000 + index}'] = [
+                None if random_source.random() < 0.12 else random_source.choice([0, 5, 10, 10, 7, 3])
+                for _ in range(positions)
+            ]
+        dates, closes = self._series(series)
+
+        result = compute_high_low_flags(dates, closes)
+
+        for position in range(self.window_size, positions):
+            target_day = dates[position]
+            history_days = dates[position - self.window_size:position]
+            expected_flags = []
+            expected_valid_count = 0
+            for stock_code in sorted(series):
+                stock_closes = closes[stock_code]
+                target_close = stock_closes.get(target_day)
+                if target_close is None:
+                    continue
+                expected_valid_count += 1
+                history = tuple(
+                    Decimal('0') if stock_closes.get(day) is None else stock_closes[day]
+                    for day in history_days
+                )
+                is_new_high = target_close >= max(history)
+                is_new_low = target_close <= min(history)
+                if is_new_high or is_new_low:
+                    expected_flags.append((stock_code, is_new_high, is_new_low))
+
+            self.assertEqual(result.valid_stock_counts_by_date[target_day], expected_valid_count)
+            self.assertEqual(
+                [
+                    (flag.stock_code, flag.is_new_high, flag.is_new_low)
+                    for flag in result.flags_by_date[target_day]
+                ],
+                expected_flags,
+                f'Mismatch at {target_day}',
+            )

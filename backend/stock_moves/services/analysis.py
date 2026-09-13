@@ -17,7 +17,7 @@ class StockMoveAnalysisItem:
     rank: int
     stock_code: str
     stock_name: str
-    parent_industries: tuple[dict[str, str], ...]
+    industries: tuple[dict[str, str], ...]
     change_percent: Decimal
     turnover: Decimal
 
@@ -31,47 +31,42 @@ class StockMoveAnalysis:
 
 
 def build_stock_move_analysis(snapshot: CompleteMarketSnapshot) -> StockMoveAnalysis:
-    """Select and rank the four SSE/SZSE large-move groups from one complete snapshot."""
-    parent_industries_by_stock = _parent_industries_by_stock(snapshot)
+    """Select and rank the SSE/SZSE/BSE large-move groups.
+
+    The six ``*_rise``/``*_fall`` groups answer "which stocks moved a lot on
+    heavy volume, per market and per direction". Beijing Stock Exchange stocks
+    meet the same two thresholds but belong to neither of the two main
+    exchanges, so they get their own pair of groups instead of only being
+    reported as a dropped count.
+    """
+    industries_by_stock = _industries_by_stock(snapshot)
     candidates: dict[str, list[StockMoveAnalysisItem]] = {
         choice: [] for choice in StockMoveItem.Group.values
     }
     warnings: list[str] = []
-    qualifying_bse_count = 0
 
     for price in snapshot.prices:
         if not _has_usable_price(price):
             continue
         group = _group_for_price(price.exchange, price.change_percent, price.turnover)
         if group is None:
-            if (
-                price.exchange == 'bse'
-                and _meets_move_and_turnover_threshold(price.change_percent, price.turnover)
-            ):
-                qualifying_bse_count += 1
             continue
 
-        industries = parent_industries_by_stock.get(price.stock_code, ())
+        industries = industries_by_stock.get(price.stock_code, ())
         if not price.stock_name:
             warnings.append(f'股票 {price.stock_code} 名称缺失。')
         if not industries:
-            warnings.append(f'股票 {price.stock_code} 未映射到开盘啦父行业。')
+            warnings.append(f'股票 {price.stock_code} 未映射到开盘啦板块。')
         candidates[group].append(
             StockMoveAnalysisItem(
                 group=group,
                 rank=0,
                 stock_code=price.stock_code,
                 stock_name=price.stock_name,
-                parent_industries=industries,
+                industries=industries,
                 change_percent=price.change_percent,
                 turnover=price.turnover,
             )
-        )
-
-    if qualifying_bse_count:
-        warnings.append(
-            f'已排除 {qualifying_bse_count} 只符合阈值的北京证券交易所股票；'
-            '它们不属于上证或深证四组。'
         )
 
     items: list[StockMoveAnalysisItem] = []
@@ -88,7 +83,7 @@ def build_stock_move_analysis(snapshot: CompleteMarketSnapshot) -> StockMoveAnal
                 rank=rank,
                 stock_code=item.stock_code,
                 stock_name=item.stock_name,
-                parent_industries=item.parent_industries,
+                industries=item.industries,
                 change_percent=item.change_percent,
                 turnover=item.turnover,
             )
@@ -103,9 +98,9 @@ def build_stock_move_analysis(snapshot: CompleteMarketSnapshot) -> StockMoveAnal
     )
 
 
-def _parent_industries_by_stock(snapshot: CompleteMarketSnapshot):
+def _industries_by_stock(snapshot: CompleteMarketSnapshot):
     result: dict[str, list[dict[str, str]]] = {}
-    for industry in snapshot.parent_industries:
+    for industry in snapshot.industries:
         label = {'code': industry.code, 'name': industry.name}
         for stock_code in industry.stock_codes:
             result.setdefault(stock_code, []).append(label)
@@ -123,30 +118,40 @@ def _has_usable_price(price) -> bool:
     )
 
 
-def _meets_move_and_turnover_threshold(change_percent: Decimal, turnover: Decimal) -> bool:
-    return (
-        (change_percent >= CHANGE_PERCENT_THRESHOLD or change_percent <= -CHANGE_PERCENT_THRESHOLD)
-        and turnover >= TURNOVER_THRESHOLD
-    )
-
-
 def _group_for_price(exchange: str, change_percent: Decimal, turnover: Decimal) -> str | None:
     if turnover < TURNOVER_THRESHOLD:
         return None
+    if abs(change_percent) < CHANGE_PERCENT_THRESHOLD:
+        return None
     if exchange == 'sse':
-        if change_percent >= CHANGE_PERCENT_THRESHOLD:
-            return StockMoveItem.Group.SSE_RISE
-        if change_percent <= -CHANGE_PERCENT_THRESHOLD:
-            return StockMoveItem.Group.SSE_FALL
+        return (
+            StockMoveItem.Group.SSE_RISE
+            if change_percent > 0
+            else StockMoveItem.Group.SSE_FALL
+        )
     if exchange == 'szse':
-        if change_percent >= CHANGE_PERCENT_THRESHOLD:
-            return StockMoveItem.Group.SZSE_RISE
-        if change_percent <= -CHANGE_PERCENT_THRESHOLD:
-            return StockMoveItem.Group.SZSE_FALL
+        return (
+            StockMoveItem.Group.SZSE_RISE
+            if change_percent > 0
+            else StockMoveItem.Group.SZSE_FALL
+        )
+    if exchange == 'bse':
+        # 北交所和沪深一样按方向拆组：页面是"行=市场、列=涨跌"的看板，
+        # 混成一组就没法落进"北交所上涨 / 北交所下跌"这两栏。
+        return (
+            StockMoveItem.Group.BSE_RISE
+            if change_percent > 0
+            else StockMoveItem.Group.BSE_FALL
+        )
     return None
 
 
 def _sort_key(group: str, item: StockMoveAnalysisItem):
-    if group in (StockMoveItem.Group.SSE_RISE, StockMoveItem.Group.SZSE_RISE):
+    # 上涨组按涨幅降序、下跌组按涨幅升序，让每组最有代表性的股票先出现。
+    if group in (
+        StockMoveItem.Group.SSE_RISE,
+        StockMoveItem.Group.SZSE_RISE,
+        StockMoveItem.Group.BSE_RISE,
+    ):
         return (-item.change_percent, item.stock_code)
     return (item.change_percent, item.stock_code)

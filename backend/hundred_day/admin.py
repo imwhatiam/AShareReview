@@ -14,7 +14,7 @@ class HundredDayStockFlagInline(admin.TabularInline):
     extra = 0
     can_delete = False
     readonly_fields = (
-        'stock_code', 'stock_name', 'parent_industries', 'is_new_high', 'is_new_low',
+        'stock_code', 'stock_name', 'industries', 'is_new_high', 'is_new_low',
     )
 
 

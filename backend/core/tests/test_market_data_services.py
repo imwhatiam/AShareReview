@@ -73,7 +73,37 @@ class MarketDataServiceTests(TestCase):
 
         self.assertEqual(actual, date(2026, 9, 4))
 
-    def test_snapshot_uses_plain_contracts_and_only_parent_industries(self):
+    def test_intraday_version_promotes_the_default_entry_to_today(self):
+        """盘中刷新发布当天的完整版本后，默认入口必须跟当天，而不是停在昨天。"""
+        from core.models import DataVersion
+        from core.services.market_data import latest_complete_stock_price_date
+
+        DataVersion.objects.create(
+            dataset_key='stock_daily_prices',
+            version='prices-20260907-intraday',
+            business_date=date(2026, 9, 7),
+            status=DataVersion.Status.COMPLETE,
+            expected_record_count=1,
+            actual_record_count=1,
+        )
+
+        actual = latest_complete_stock_price_date(
+            datetime(2026, 9, 7, 14, 0, tzinfo=SHANGHAI)
+        )
+
+        self.assertEqual(actual, date(2026, 9, 7))
+
+    def test_without_an_intraday_version_the_default_entry_stays_yesterday(self):
+        """当天还没有完整版本时（例如 09:30 前），行为与收盘前一致。"""
+        from core.services.market_data import latest_complete_stock_price_date
+
+        actual = latest_complete_stock_price_date(
+            datetime(2026, 9, 7, 14, 0, tzinfo=SHANGHAI)
+        )
+
+        self.assertEqual(actual, date(2026, 9, 4))
+
+    def test_snapshot_uses_plain_contracts_and_every_industry(self):
         from core.models import DailyPrice, IndustrySnapshot, Stock
         from core.services.market_data import get_complete_market_snapshot
 
@@ -101,13 +131,11 @@ class MarketDataServiceTests(TestCase):
         IndustrySnapshot.objects.create(
             industry_code='801660',
             industry_name='通信',
-            industry_level=IndustrySnapshot.Level.PARENT,
             stock_codes=['000001', '430047'],
         )
         IndustrySnapshot.objects.create(
             industry_code='801206',
             industry_name='光模块',
-            industry_level=IndustrySnapshot.Level.CHILD,
             stock_codes=['000001'],
         )
 
@@ -119,7 +147,7 @@ class MarketDataServiceTests(TestCase):
             [('000001', 'szse'), ('430047', 'bse')],
         )
         self.assertEqual(
-            [(industry.code, industry.name) for industry in snapshot.parent_industries],
-            [('801660', '通信')],
+            [(industry.code, industry.name) for industry in snapshot.industries],
+            [('801206', '光模块'), ('801660', '通信')],
         )
         self.assertFalse(hasattr(snapshot.prices[0], '_meta'))

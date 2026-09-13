@@ -99,7 +99,9 @@ class SessionApiTests(TestCase):
         login_body = json.loads(login_response.content)
 
         self.assertEqual(login_response.status_code, 403)
-        self.assertEqual(login_body['error']['code'], 'INVALID_PARAMETER')
+        # CSRF 失败有自己的错误码：`INVALID_PARAMETER` 会让调用方去查参数，
+        # 而这里的正确动作是刷新页面/重新登录。
+        self.assertEqual(login_body['error']['code'], 'CSRF_FAILED')
 
         csrf_token = self._get_csrf_token(client)
         client.post(
@@ -115,7 +117,7 @@ class SessionApiTests(TestCase):
         logout_body = json.loads(logout_response.content)
 
         self.assertEqual(logout_response.status_code, 403)
-        self.assertEqual(logout_body['error']['code'], 'INVALID_PARAMETER')
+        self.assertEqual(logout_body['error']['code'], 'CSRF_FAILED')
         self.assertTrue(client.get('/api/core/session/').json()['data']['authenticated'])
 
     def test_logout_clears_the_session(self):

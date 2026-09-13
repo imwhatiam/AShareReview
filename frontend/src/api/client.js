@@ -72,7 +72,11 @@ export function createApiClient({
     if (response.status === 401 && notifyUnauthorized) {
       onUnauthorized(envelope)
     }
-    if (!response.ok && response.status !== 202) {
+    if (!response.ok) {
+      // `Response.ok` 覆盖 200–299，而 `202 DATA_PREPARING` 落在这一区间、本身
+      // `ok === true`，所以这里不需要为"数据准备中"开例外：它走正常返回，
+      // 由页面按 `error.code` 渲染成准备中状态。非 2xx（含 4xx/5xx）一律抛错，
+      // 页面拿 `error.envelope` 决定是空态还是失败。
       throw new ApiClientError({
         status: response.status,
         code: envelope.error?.code ?? 'REQUEST_FAILED',

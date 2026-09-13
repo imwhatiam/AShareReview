@@ -5,7 +5,7 @@ from datetime import date
 from decimal import Decimal
 from typing import Mapping
 
-from core.services.contracts import MarketDataVersion, ParentIndustry
+from core.services.contracts import MarketDataVersion, Industry
 from hundred_day.services.flags import HighLowFlag, HighLowFlagResult, compute_high_low_flags
 
 MAX_INPUT_TRADING_DAY_POSITIONS = 199
@@ -17,6 +17,14 @@ class InsufficientHundredDayHistory(ValueError):
 
 
 @dataclass(frozen=True)
+class TargetDayQuote:
+    """目标交易日的行情，用于板块明细里展示涨幅与成交额。"""
+
+    change_percent: Decimal | None
+    turnover: Decimal | None
+
+
+@dataclass(frozen=True)
 class HistoricalCloseData:
     """The bounded local public-data input needed for hundred-day analysis."""
 
@@ -24,16 +32,28 @@ class HistoricalCloseData:
     trading_days: tuple[date, ...]
     close_prices_by_stock: Mapping[str, Mapping[date, Decimal | None]]
     stock_names_by_code: Mapping[str, str]
-    parent_industries: tuple[ParentIndustry, ...]
+    industries: tuple[Industry, ...]
+    # 只覆盖目标交易日：明细里要展示当日的涨幅与成交额，历史日不需要。
+    target_day_quotes: Mapping[str, TargetDayQuote]
 
 
 @dataclass(frozen=True)
 class HundredDayStockAnalysis:
     stock_code: str
     stock_name: str
-    parent_industries: tuple[dict[str, str], ...]
+    industries: tuple[dict[str, str], ...]
     is_new_high: bool
     is_new_low: bool
+
+
+@dataclass(frozen=True)
+class HundredDayStockDetail:
+    """板块明细里的一只股票：名称加当日涨幅与成交额。"""
+
+    stock_code: str
+    stock_name: str
+    change_percent: Decimal | None
+    turnover: Decimal | None
 
 
 @dataclass(frozen=True)
@@ -43,8 +63,8 @@ class HundredDayIndustryAnalysis:
     stock_count: int
     new_high_count: int
     new_low_count: int
-    new_high_stocks: tuple[dict[str, str], ...]
-    new_low_stocks: tuple[dict[str, str], ...]
+    new_high_stocks: tuple[HundredDayStockDetail, ...]
+    new_low_stocks: tuple[HundredDayStockDetail, ...]
 
 
 @dataclass(frozen=True)
@@ -70,8 +90,8 @@ class HundredDayAnalysis:
     trend_points: tuple[HundredDayTrendAnalysis, ...]
 
 
-def _parent_industries_by_stock(
-    industries: tuple[ParentIndustry, ...],
+def _industries_by_stock(
+    industries: tuple[Industry, ...],
 ) -> dict[str, tuple[dict[str, str], ...]]:
     memberships: dict[str, list[dict[str, str]]] = {}
     for industry in industries:
@@ -98,7 +118,7 @@ def _stock_analysis(
         HundredDayStockAnalysis(
             stock_code=flag.stock_code,
             stock_name=source.stock_names_by_code.get(flag.stock_code, flag.stock_code),
-            parent_industries=memberships.get(flag.stock_code, ()),
+            industries=memberships.get(flag.stock_code, ()),
             is_new_high=flag.is_new_high,
             is_new_low=flag.is_new_low,
         )
@@ -106,23 +126,38 @@ def _stock_analysis(
     )
 
 
+def _stock_detail(
+    stock_code: str,
+    flagged_by_stock: Mapping[str, HundredDayStockAnalysis],
+    quotes: Mapping[str, TargetDayQuote],
+) -> HundredDayStockDetail:
+    quote = quotes.get(stock_code)
+    return HundredDayStockDetail(
+        stock_code=stock_code,
+        stock_name=flagged_by_stock[stock_code].stock_name,
+        change_percent=quote.change_percent if quote is not None else None,
+        turnover=quote.turnover if quote is not None else None,
+    )
+
+
 def _industry_summaries(
     *,
     stock_flags: tuple[HundredDayStockAnalysis, ...],
     valid_stock_codes: set[str],
-    industries: tuple[ParentIndustry, ...],
+    industries: tuple[Industry, ...],
+    quotes: Mapping[str, TargetDayQuote],
 ) -> tuple[HundredDayIndustryAnalysis, ...]:
     flagged_by_stock = {flag.stock_code: flag for flag in stock_flags}
     summaries: list[HundredDayIndustryAnalysis] = []
     for industry in sorted(industries, key=lambda item: item.code):
         stock_codes = tuple(sorted(set(industry.stock_codes) & valid_stock_codes))
         high_stocks = tuple(
-            {'code': stock_code, 'name': flagged_by_stock[stock_code].stock_name}
+            _stock_detail(stock_code, flagged_by_stock, quotes)
             for stock_code in stock_codes
             if stock_code in flagged_by_stock and flagged_by_stock[stock_code].is_new_high
         )
         low_stocks = tuple(
-            {'code': stock_code, 'name': flagged_by_stock[stock_code].stock_name}
+            _stock_detail(stock_code, flagged_by_stock, quotes)
             for stock_code in stock_codes
             if stock_code in flagged_by_stock and flagged_by_stock[stock_code].is_new_low
         )
@@ -189,7 +224,7 @@ def build_hundred_day_analysis(
 
     business_date = source.data_version.business_date
     target_flags = flag_result.flags_by_date[business_date]
-    memberships = _parent_industries_by_stock(source.parent_industries)
+    memberships = _industries_by_stock(source.industries)
     stock_flags = _stock_analysis(target_flags, source, memberships)
     valid_stock_codes = {
         stock_code
@@ -208,7 +243,8 @@ def build_hundred_day_analysis(
         industry_summaries=_industry_summaries(
             stock_flags=stock_flags,
             valid_stock_codes=valid_stock_codes,
-            industries=source.parent_industries,
+            industries=source.industries,
+            quotes=source.target_day_quotes,
         ),
         trend_points=trend_points,
     )

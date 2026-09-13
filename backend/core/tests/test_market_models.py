@@ -5,7 +5,7 @@ from django.test import TestCase
 
 
 class MarketReferenceModelTests(TestCase):
-    def test_industry_snapshot_has_only_four_business_fields(self):
+    def test_industry_snapshot_has_only_three_business_fields(self):
         from core.models import IndustrySnapshot
 
         fields = {
@@ -16,22 +16,20 @@ class MarketReferenceModelTests(TestCase):
 
         self.assertEqual(
             fields,
-            {'industry_code', 'industry_name', 'industry_level', 'stock_codes'},
+            {'industry_code', 'industry_name', 'stock_codes'},
         )
 
-    def test_same_stock_can_belong_to_multiple_parent_industries(self):
+    def test_same_stock_can_belong_to_multiple_industries(self):
         from core.models import IndustrySnapshot
 
         IndustrySnapshot.objects.create(
             industry_code='801660',
             industry_name='通信',
-            industry_level=IndustrySnapshot.Level.PARENT,
             stock_codes=['000801', '300308'],
         )
         IndustrySnapshot.objects.create(
             industry_code='801080',
             industry_name='电子',
-            industry_level=IndustrySnapshot.Level.PARENT,
             stock_codes=['000801'],
         )
 

@@ -12,10 +12,13 @@ https://docs.djangoproject.com/en/6.1/ref/settings/
 
 from pathlib import Path
 
-from core.module_registry import get_enabled_app_configs
+from django.core.exceptions import ImproperlyConfigured
+
+from core.module_registry import get_enabled_app_configs, get_enabled_modules
 
 from backend.env import (
     get_bool_setting,
+    get_int_setting,
     get_list_setting,
     get_path_setting,
     get_setting,
@@ -37,6 +40,14 @@ DEBUG = get_bool_setting('DJANGO_DEBUG', default=False)
 
 ALLOWED_HOSTS = get_list_setting('DJANGO_ALLOWED_HOSTS')
 DATA_COMMAND_LOG_LEVEL = (get_setting('DATA_COMMAND_LOG_LEVEL', 'INFO') or 'INFO').upper()
+# 应用自身日志（core / 四个业务模块 / 请求访问日志）的级别；生产想只留告警时
+# 可以调到 WARNING，不必重启前先改代码。
+APP_LOG_LEVEL = (get_setting('DJANGO_LOG_LEVEL', 'INFO') or 'INFO').upper()
+# plain = 人读的单行 key=value；json = 每行一个 JSON 对象，交给日志采集器。
+LOG_FORMAT = (get_setting('DJANGO_LOG_FORMAT', 'plain') or 'plain').strip().lower()
+# 超过这个耗时的请求升级为 WARNING：本项目的读路径会按需本地生成派生结果，
+# 一次"打开页面顺便算了 8 秒"必须在日志里自己冒出来，而不是靠用户反馈。
+REQUEST_LOG_SLOW_MS = get_int_setting('DJANGO_REQUEST_LOG_SLOW_MS', 1000)
 
 
 # Application definition
@@ -54,6 +65,8 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    # 放在会话/鉴权之前：这样鉴权失败的 401 也带 request_id 和耗时。
+    'core.middleware.RequestLoggingMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -94,10 +107,6 @@ DATABASES = {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': get_path_setting('KAIPANLA_DATABASE_PATH'),
     },
-    'eastmoney': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': get_path_setting('EASTMONEY_DATABASE_PATH'),
-    },
     'stock_moves': {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': get_path_setting('STOCK_MOVES_DATABASE_PATH'),
@@ -114,27 +123,66 @@ DATABASES = {
 DATABASE_ROUTERS = ['backend.db_router.AppDatabaseRouter']
 
 
+def _samesite_setting(name: str) -> str:
+    """Read a ``SameSite`` cookie policy, rejecting typos loudly.
+
+    Django drops a cookie whose ``SameSite`` value it does not recognise and
+    reports nothing: a misspelt ``SESSION_COOKIE_SAMESITE=laxx`` silently
+    breaks login instead of failing the boot.
+    """
+    raw = (get_setting(name, 'Lax') or 'Lax').strip()
+    value = raw.capitalize()
+    if value not in {'Lax', 'Strict', 'None'}:
+        raise ImproperlyConfigured(
+            f'{name} must be one of Lax, Strict, None (got {raw!r}).'
+        )
+    return value
+
+
 SESSION_COOKIE_SECURE = get_bool_setting('SESSION_COOKIE_SECURE', default=True)
 SESSION_COOKIE_HTTPONLY = get_bool_setting('SESSION_COOKIE_HTTPONLY', default=True)
-SESSION_COOKIE_SAMESITE = get_setting('SESSION_COOKIE_SAMESITE', 'Lax')
+SESSION_COOKIE_SAMESITE = _samesite_setting('SESSION_COOKIE_SAMESITE')
 CSRF_COOKIE_SECURE = get_bool_setting('CSRF_COOKIE_SECURE', default=True)
-CSRF_COOKIE_SAMESITE = get_setting('CSRF_COOKIE_SAMESITE', 'Lax')
+CSRF_COOKIE_SAMESITE = _samesite_setting('CSRF_COOKIE_SAMESITE')
 CSRF_TRUSTED_ORIGINS = get_list_setting('CSRF_TRUSTED_ORIGINS')
 CSRF_FAILURE_VIEW = 'core.views.csrf_failure'
 
 
+# 日志：dictConfig（Django 会先应用 DEFAULT_LOGGING，再用这里覆盖，见
+# django.utils.log.configure_logging）。约定见 core/logging.py 与 docs/deployment.md。
+#
+# 业务模块的 logger 名从注册表推导，而不是手写第二份清单：手写时新模块的 logger
+# 不在 LOGGING 里、又没有 root 处理器，日志会被 logging.lastResort 直接丢到 stderr。
+_APP_LOG_LOGGERS = (
+    'core',
+    *(module.module_id for module in get_enabled_modules()),
+)
+
 LOGGING = {
     'version': 1,
+    # 必须 False：True 会让 Django 默认配置里的 django.request / django.server
+    # 一起静音，4xx/5xx 与开发服务器访问日志会连带消失。
     'disable_existing_loggers': False,
     'formatters': {
+        # request_id= 由 RequestContextFilter 兜底注入，命令行进程里显示为 "-"。
         'standard': {
-            'format': '%(asctime)s %(levelname)s %(name)s %(message)s',
+            'format': '%(asctime)s %(levelname)s %(name)s request_id=%(request_id)s %(message)s',
+        },
+        'json': {
+            '()': 'core.logging.JsonFormatter',
         },
     },
+    'filters': {
+        'request_id': {'()': 'core.logging.RequestContextFilter'},
+    },
     'handlers': {
+        # 重新定义 Django 默认的 console 处理器：给它加上 request_id 过滤器与
+        # 自己的格式，django.request/django 的日志也一并走这里（始终输出，不再
+        # 只在 DEBUG 下可见）。
         'console': {
             'class': 'logging.StreamHandler',
-            'formatter': 'standard',
+            'formatter': 'json' if LOG_FORMAT == 'json' else 'standard',
+            'filters': ['request_id'],
         },
     },
     'loggers': {
@@ -142,6 +190,14 @@ LOGGING = {
             'handlers': ['console'],
             'level': DATA_COMMAND_LOG_LEVEL,
             'propagate': False,
+        },
+        **{
+            name: {
+                'handlers': ['console'],
+                'level': APP_LOG_LEVEL,
+                'propagate': False,
+            }
+            for name in _APP_LOG_LOGGERS
         },
     },
 }
@@ -192,3 +248,31 @@ MAILERS = {
         'BACKEND': 'django.core.mail.backends.console.EmailBackend',
     },
 }
+
+
+def _admin_entries(name: str) -> list[tuple[str, str]]:
+    """Parse ``Name:email, Name:email`` into Django's ``ADMINS`` format.
+
+    Django ships ``ADMINS = []`` and ``SERVER_EMAIL = 'root@localhost'``, and
+    ``mail_admins`` silently does nothing when there is no recipient. The 5xx
+    alert path therefore used to be imaginary: there is a ``MAILERS`` backend, the
+    middleware comment promised an admin mail, and no address was ever configured.
+    A typo here would recreate the same silence, so a malformed entry fails at boot.
+    """
+    entries = []
+    for raw in get_list_setting(name):
+        label, separator, address = raw.partition(':')
+        if not separator or not label.strip() or '@' not in address:
+            raise ImproperlyConfigured(
+                f'{name} entries must look like "Name:email@example.com" '
+                f'(got {raw!r}).'
+            )
+        entries.append((label.strip(), address.strip()))
+    return entries
+
+
+# 空列表 = 不发告警邮件（默认）。填上地址后，生产环境（DEBUG=false）的 5xx 才会
+# 真的通过上面的 MAILERS 发出去；本地开发看到的是 console 后端打印的正文。
+ADMINS = _admin_entries('DJANGO_ADMINS')
+MANAGERS = ADMINS
+SERVER_EMAIL = get_setting('DJANGO_SERVER_EMAIL', 'root@localhost') or 'root@localhost'

@@ -36,19 +36,19 @@ class HundredDayModelTests(TestCase):
         self.assertEqual(result.new_low_count, 8)
         self.assertEqual(result.source_industry_version, 'industries-v1')
 
-    def test_stock_flag_is_unique_per_date_result_and_keeps_parent_industries(self):
+    def test_stock_flag_is_unique_per_date_result_and_keeps_industries(self):
         result = self._result()
         flag = HundredDayStockFlag.objects.create(
             result=result,
             stock_code='600000',
             stock_name='浦发银行',
-            parent_industries=[{'code': 'I001', 'name': '银行'}],
+            industries=[{'code': 'I001', 'name': '银行'}],
             is_new_high=True,
             is_new_low=False,
         )
 
         self.assertTrue(flag.is_new_high)
-        self.assertEqual(flag.parent_industries, [{'code': 'I001', 'name': '银行'}])
+        self.assertEqual(flag.industries, [{'code': 'I001', 'name': '银行'}])
         with self.assertRaises(IntegrityError), transaction.atomic():
             HundredDayStockFlag.objects.create(
                 result=result,
@@ -64,8 +64,11 @@ class HundredDayModelTests(TestCase):
             stock_count=3,
             new_high_count=2,
             new_low_count=1,
-            new_high_stocks=[{'code': '600000', 'name': '浦发银行'}],
-            new_low_stocks=[{'code': '600001', 'name': '邯郸钢铁'}],
+            new_high_stocks=[{
+                'code': '600000', 'name': '浦发银行',
+                'change_percent': '3.210000', 'turnover': '98765432.1000',
+            }],
+            new_low_stocks=[{'code': '600001', 'name': '邯郸钢铁', 'change_percent': None, 'turnover': None}],
         )
 
         self.assertEqual(summary.new_high_stocks[0]['code'], '600000')

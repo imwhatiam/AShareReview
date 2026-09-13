@@ -1,6 +1,7 @@
 from datetime import date
 
 from core.management.base import BaseDataCommand
+from core.logging import log_command_progress
 from hundred_day.services.analysis import build_hundred_day_analysis
 from hundred_day.services.source_data import load_hundred_day_source_data
 from hundred_day.services.source_versions import get_complete_industry_snapshot_version
@@ -25,11 +26,21 @@ class Command(BaseDataCommand):
         source_daily_price_version = ''
         source_industry_version = ''
         try:
+            log_command_progress('hundred_day', action='loading_source', date=business_date)
             source = load_hundred_day_source_data(business_date)
             source_daily_price_version = source.data_version.version
             source_industry_version = get_complete_industry_snapshot_version()
+            log_command_progress(
+                'hundred_day', action='analyzing', date=business_date, source=source_daily_price_version
+            )
             analysis = build_hundred_day_analysis(
                 source, source_industry_version=source_industry_version
+            )
+            log_command_progress(
+                'hundred_day',
+                action='analyzed',
+                date=business_date,
+                stocks=len(analysis.stock_flags),
             )
         except Exception as error:
             if not options['dry_run']:
@@ -43,6 +54,7 @@ class Command(BaseDataCommand):
 
         if options['dry_run']:
             return analysis, None, True
+        log_command_progress('hundred_day', action='writing', date=business_date)
         return analysis, write_hundred_day_analysis(analysis=analysis), False
 
     def format_success_message(self, result, options):

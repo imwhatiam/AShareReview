@@ -1,4 +1,3 @@
-import EastmoneyPage from '../features/eastmoney/EastmoneyPage'
 import KaipanlaPage from '../features/kaipanla/KaipanlaPage'
 import StockMovesPage from '../features/stock-moves/StockMovesPage'
 import HundredDayPage from '../features/hundred-day/HundredDayPage'
@@ -23,6 +22,7 @@ export function buildNavigation(modules) {
   const analysisModules = modules.filter(
     (module) => module.navigation_group !== FUND_FLOW_GROUP,
   )
+  // 一级 Tab 只用文字标签，不带图标（四个 Tab 的左侧图标已按需求去掉）。
   const navigation = analysisModules.map((module) => ({
     id: module.id,
     label: module.display_name,
@@ -48,7 +48,6 @@ export function navigationIdForModule(module) {
 
 export function getModuleComponent(moduleId) {
   if (moduleId === 'kaipanla') return KaipanlaPage
-  if (moduleId === 'eastmoney') return EastmoneyPage
   if (moduleId === 'stock_moves') return StockMovesPage
   if (moduleId === 'sector_momentum') return SectorMomentumPage
   if (moduleId === 'hundred_day') return HundredDayPage

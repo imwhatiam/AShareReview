@@ -30,6 +30,8 @@ class KaipanlaApiTests(TestCase):
                 trade_date=self.trade_date,
                 snapshot_time=timezone.make_aware(datetime(2026, 9, 8, 15, 0)),
                 main_net_inflow=Decimal(net_inflow),
+                # 行必须带上"发布它的版本"：读路径只服务已发布版本的行。
+                source_data_version='kaipanla-test-version',
                 source_batch_id='published-snapshot',
             )
         DataVersion.objects.create(
@@ -107,24 +109,58 @@ class KaipanlaApiTests(TestCase):
         self.assertEqual(response.json()['data']['dates'], ['2026-09-08'])
         self.assertEqual(response.json()['source'], 'database')
 
+    @patch('kaipanla.services.read_path._repair_current_snapshot')
+    def test_dates_never_spends_an_upstream_request(self, repair):
+        """纯元信息端点被前端轮询：不能因为"问了有哪几天"就去抓一次上游。"""
+        DataVersion.objects.all().delete()
+
+        response = self._authenticated_client().get('/api/kaipanla/dates/')
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()['error']['code'], 'DATA_NOT_AVAILABLE')
+        repair.assert_not_called()
+
     @patch('kaipanla.services.read_path._can_attempt_repair', return_value=True)
     @patch('kaipanla.services.read_path._repair_current_snapshot')
     def test_missing_data_reports_sync_in_progress_when_repair_lock_is_held(
         self, repair, can_repair
     ):
-        from core.api.errors import ApiError, ErrorCode
+        from core.services.locking import DatasetBusy
 
         DataVersion.objects.all().delete()
-        repair.side_effect = ApiError(
-            ErrorCode.SYNC_IN_PROGRESS,
-            '开盘啦板块资金流正在同步，请稍后重试。',
-            http_status=409,
-            preparation_state='syncing',
+        repair.side_effect = DatasetBusy(
+            'kaipanla:kaipanla_sector_fund_flow is already running.'
         )
 
         response = self._authenticated_client().get('/api/kaipanla/sectors/intraday/')
 
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.json()['error']['code'], 'SYNC_IN_PROGRESS')
+        self.assertEqual(response.json()['preparation']['state'], 'syncing')
         can_repair.assert_called_once()
         repair.assert_called_once()
+
+    def test_an_unpublished_snapshot_row_is_never_served(self):
+        """行已落库、版本还没标 complete：它既不能返回，也不能冒充上一个版本。
+
+        写行与发布分属 kaipanla / default 两个库，崩溃正好落在中间时会留下这种行；
+        旧代码会按 Max(snapshot_time) 取到它，然后用**上一个完整版本**的版本号返回
+        并按那个版本键写缓存，之后一直命中假缓存。
+        """
+        KaipanlaSectorFundFlowSnapshot.objects.using('kaipanla').create(
+            sector_code='C',
+            sector_name='丙行业',
+            trade_date=self.trade_date,
+            snapshot_time=timezone.make_aware(datetime(2026, 9, 8, 15, 5)),
+            main_net_inflow=Decimal('999'),
+            source_data_version='kaipanla-running-version',
+            source_batch_id='crashed-batch',
+        )
+
+        response = self._authenticated_client().get('/api/kaipanla/sectors/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['data_version'], 'kaipanla-test-version')
+        self.assertEqual(
+            sorted(item['code'] for item in response.json()['data']['sectors']), ['A', 'B']
+        )

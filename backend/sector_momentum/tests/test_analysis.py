@@ -7,7 +7,7 @@ from core.services.contracts import (
     CompleteMarketSnapshot,
     MarketDataVersion,
     MarketPrice,
-    ParentIndustry,
+    Industry,
 )
 from sector_momentum.services.analysis import build_sector_momentum_analysis
 
@@ -37,7 +37,7 @@ class SectorMomentumAnalysisTests(SimpleTestCase):
         return CompleteMarketSnapshot(
             data_version=MarketDataVersion('daily-prices-v1', self.business_date),
             prices=tuple(prices),
-            parent_industries=tuple(industries),
+            industries=tuple(industries),
         )
 
     def test_above_five_percent_excludes_exactly_five_percent_and_uses_score_formula(self):
@@ -48,7 +48,7 @@ class SectorMomentumAnalysisTests(SimpleTestCase):
                 self._price('600003', '5', '600'),
                 self._price('600004', '-1', '1000'),
             ],
-            [ParentIndustry('I1', '行业甲', ('600001', '600002', '600003'))],
+            [Industry('I1', '行业甲', ('600001', '600002', '600003'))],
         )
 
         analysis = build_sector_momentum_analysis(snapshot, 'industry-v1')
@@ -69,13 +69,14 @@ class SectorMomentumAnalysisTests(SimpleTestCase):
                 self._price('600001', '9', '100'),
                 self._price('600002', '8', '100'),
             ],
-            [ParentIndustry('I1', '行业甲', ('600001',)), ParentIndustry('I2', '行业乙', ('600003',))],
+            [Industry('I1', '行业甲', ('600001',)), Industry('I2', '行业乙', ('600003',))],
         )
 
         analysis = build_sector_momentum_analysis(snapshot, 'industry-v1')
 
         rankings = analysis.rankings_by_metric['top_5_percent']
-        self.assertEqual(analysis.top_5_percent_sample_size, 1)
+        # 3 只有效股票 → 5% 向下取整为 0，由 max(1, …) 下限抬到 1：样本只含涨幅
+        # 最高的一只（并列时按代码升序取 600001）。下限若失效，这里会是空榜。
         self.assertEqual(len(rankings), 1)
         self.assertEqual(rankings[0].industry_code, 'I1')
         self.assertEqual([item.stock_code for item in rankings[0].stocks], ['600001'])
@@ -87,8 +88,8 @@ class SectorMomentumAnalysisTests(SimpleTestCase):
                 self._price('600002', '7', '300'),
             ],
             [
-                ParentIndustry('I1', '行业甲', ('600001',)),
-                ParentIndustry('I2', '行业乙', ('600001',)),
+                Industry('I1', '行业甲', ('600001',)),
+                Industry('I2', '行业乙', ('600001',)),
             ],
         )
 
@@ -105,12 +106,13 @@ class SectorMomentumAnalysisTests(SimpleTestCase):
     def test_empty_valid_market_returns_empty_rankings_without_division_error(self):
         snapshot = self._snapshot(
             [self._price('600001', None, None, valid=False)],
-            [ParentIndustry('I1', '行业甲', ('600001',))],
+            [Industry('I1', '行业甲', ('600001',))],
         )
 
         analysis = build_sector_momentum_analysis(snapshot, 'industry-v1')
 
         self.assertEqual(analysis.total_market_turnover, Decimal('0'))
-        self.assertEqual(analysis.top_5_percent_sample_size, 0)
+        self.assertEqual(analysis.rankings_by_metric['above_5pct'], ())
+        self.assertEqual(analysis.rankings_by_metric['top_5_percent'], ())
         self.assertEqual(analysis.rankings_by_metric['above_5pct'], ())
         self.assertEqual(analysis.rankings_by_metric['top_5_percent'], ())

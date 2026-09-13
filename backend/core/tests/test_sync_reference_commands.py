@@ -84,6 +84,70 @@ class ReferenceSyncCommandTests(TestCase):
             DataVersion.Status.FAILED,
         )
 
+    def test_truncated_stock_master_list_is_rejected_without_deactivating_anything(self):
+        """上游少返回若干页时，绝不能把没出现的股票静默停用（P0-2）。"""
+        for index in range(10):
+            Stock.objects.create(
+                thscode=f'0000{index:02d}.SZ',
+                stock_code=f'0000{index:02d}',
+                stock_name=f'股票{index}',
+                exchange=Stock.Exchange.SZSE,
+            )
+        partial = tuple(
+            HithinkTicker(f'0000{index:02d}.SZ', f'0000{index:02d}', f'股票{index}', 'szse')
+            for index in range(5)
+        )
+        client = FakeHithinkClient(ticker_pages=[partial, ()])
+
+        with patch('core.services.sync_reference.HithinkClient', return_value=client):
+            with self.assertRaises(CommandError):
+                call_command('sync_stock_master', '--limit', '5')
+
+        self.assertEqual(Stock.objects.filter(is_active=True).count(), 10)
+        self.assertEqual(
+            DataVersion.objects.get(dataset_key='stock_master').status,
+            DataVersion.Status.FAILED,
+        )
+
+    def test_stock_master_sync_tolerates_a_normal_deviation(self):
+        """小幅波动（0.9 阈值内）照常写入：真退市是允许的。"""
+        for index in range(10):
+            Stock.objects.create(
+                thscode=f'0000{index:02d}.SZ',
+                stock_code=f'0000{index:02d}',
+                stock_name=f'股票{index}',
+                exchange=Stock.Exchange.SZSE,
+            )
+        remaining = tuple(
+            HithinkTicker(f'0000{index:02d}.SZ', f'0000{index:02d}', f'股票{index}', 'szse')
+            for index in range(9)
+        )
+        client = FakeHithinkClient(ticker_pages=[remaining, ()])
+
+        with patch('core.services.sync_reference.HithinkClient', return_value=client):
+            call_command('sync_stock_master', '--limit', '10')
+
+        self.assertEqual(Stock.objects.filter(is_active=True).count(), 9)
+        self.assertFalse(Stock.objects.get(stock_code='000009').is_active)
+
+    def test_dry_run_also_reports_a_truncated_stock_master_list(self):
+        for index in range(10):
+            Stock.objects.create(
+                thscode=f'0000{index:02d}.SZ',
+                stock_code=f'0000{index:02d}',
+                stock_name=f'股票{index}',
+                exchange=Stock.Exchange.SZSE,
+            )
+        partial = (HithinkTicker('000000.SZ', '000000', '股票0', 'szse'),)
+        client = FakeHithinkClient(ticker_pages=[partial, ()])
+
+        with patch('core.services.sync_reference.HithinkClient', return_value=client):
+            with self.assertRaises(CommandError):
+                call_command('sync_stock_master', '--dry-run', '--limit', '5')
+
+        self.assertEqual(Stock.objects.filter(is_active=True).count(), 10)
+        self.assertEqual(DataVersion.objects.count(), 0)
+
     def test_trading_calendar_command_replaces_the_recent_window_atomically(self):
         TradingDay.objects.create(trade_date=date(2025, 9, 8))
         client = FakeHithinkClient(trading_days=(

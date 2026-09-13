@@ -11,7 +11,7 @@ class StockMoveItemInline(admin.TabularInline):
         'rank',
         'stock_code',
         'stock_name',
-        'parent_industries',
+        'industries',
         'change_percent',
         'turnover',
     )
@@ -27,11 +27,15 @@ class StockMoveResultAdmin(admin.ModelAdmin):
         'sse_fall_count',
         'szse_rise_count',
         'szse_fall_count',
+        'bse_rise_count',
+        'bse_fall_count',
         'distinct_stock_count',
         'warnings',
     )
     list_filter = ('business_date',)
-    search_fields = ('source_daily_price_version', 'source_industry_version')
+    # 原来还列了 source_industry_version，但 StockMoveResult 上没有这个字段，
+    # 后台一搜索就会 FieldError；这个模块只依赖公共日行情版本。
+    search_fields = ('source_daily_price_version',)
     inlines = (StockMoveItemInline,)
 
 

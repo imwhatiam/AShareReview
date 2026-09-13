@@ -38,6 +38,12 @@ class KaipanlaSectorFundFlowSnapshot(models.Model):
     total_market_cap = models.DecimalField(
         max_digits=24, decimal_places=2, null=True, blank=True, verbose_name='总市值（元）'
     )
+    # 写入这份快照的 DataVersion。没有它，"行已经落库、版本还没标 complete"的那个
+    # 崩溃窗口会把新数据打上**旧**版本号返回（并按旧版本键写缓存，之后一直命中假
+    # 缓存）。读路径按"已发布版本集合"过滤本列，未发布的行就永远不可见。
+    source_data_version = models.CharField(
+        max_length=64, db_index=True, blank=True, default='', verbose_name='数据版本'
+    )
     source_batch_id = models.CharField(max_length=64, db_index=True, verbose_name='采集批次标识')
     created_at = models.DateTimeField(auto_now_add=True)
 

@@ -24,10 +24,9 @@ function sessionResponse(authenticated) {
 
 const allModules = [
   { id: 'kaipanla', display_name: '开盘啦', navigation_group: 'fund_flow', navigation_order: 10 },
-  { id: 'eastmoney', display_name: '东方财富', navigation_group: 'fund_flow', navigation_order: 20 },
-  { id: 'stock_moves', display_name: '大涨跌幅与大成交量个股', navigation_group: 'analysis', navigation_order: 30 },
-  { id: 'sector_momentum', display_name: '板块动量', navigation_group: 'analysis', navigation_order: 40 },
-  { id: 'hundred_day', display_name: '百日新高新低占比', navigation_group: 'analysis', navigation_order: 50 },
+  { id: 'stock_moves', display_name: '大涨跌幅与大成交量个股', navigation_group: 'analysis', navigation_order: 20 },
+  { id: 'sector_momentum', display_name: '板块动量', navigation_group: 'analysis', navigation_order: 30 },
+  { id: 'hundred_day', display_name: '百日新高新低占比', navigation_group: 'analysis', navigation_order: 40 },
 ]
 
 function modulesResponse(modules) {
@@ -67,13 +66,6 @@ describe('App shell', () => {
           data: { time_points: [], series: [] },
         })
       }
-      if (path === '/api/eastmoney/sectors/intraday/?inflow_top=25&outflow_top=25') {
-        return jsonResponse({
-          status: 'error',
-          error: { code: 'DATA_PREPARING' },
-          data: null,
-        }, 202)
-      }
       throw new Error(`Unexpected request: ${path}`)
     })
 
@@ -85,23 +77,46 @@ describe('App shell', () => {
     fireEvent.click(screen.getByRole('button', { name: '登录' }))
 
     expect(await screen.findByText('暂无数据')).toBeInTheDocument()
+    // 空数据只隐藏图表与榜单，日期与统计窗口控件保留在页面上。
+    expect(screen.getByLabelText('数据日期')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '当日' })).toBeInTheDocument()
     expect(fetchImpl).toHaveBeenCalledWith(
       '/api/kaipanla/sectors/intraday/?inflow_top=25&outflow_top=25',
       expect.objectContaining({ credentials: 'same-origin' }),
     )
-    expect(screen.getByText('当前模块：开盘啦')).toBeInTheDocument()
+    expect(screen.getByRole('tabpanel', { name: '开盘啦' })).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: '板块资金流' })).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: '大涨跌幅与大成交量个股' })).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: '板块动量' })).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: '百日新高新低占比' })).toBeInTheDocument()
-    expect(screen.getByRole('tab', { name: '开盘啦' })).toBeInTheDocument()
-    expect(screen.getByRole('tab', { name: '东方财富' })).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('tab', { name: '东方财富' }))
-    expect(await screen.findByText('数据准备中，请稍后刷新。')).toBeInTheDocument()
-    expect(fetchImpl).toHaveBeenCalledWith(
-      '/api/eastmoney/sectors/intraday/?inflow_top=25&outflow_top=25',
-      expect.objectContaining({ credentials: 'same-origin' }),
-    )
+    // 四个一级 Tab 只保留文字标签：左侧图标已按需求去掉，标签里不再有 svg。
+    const tabs = screen.getAllByRole('tab')
+    expect(tabs).toHaveLength(4)
+    expect(tabs.map((tab) => tab.querySelector('svg'))).toEqual([null, null, null, null])
+  })
+
+  it('never renders the removed data-source switcher or the module breadcrumb', async () => {
+    const fetchImpl = vi.fn(async (path) => {
+      if (path === '/api/core/session/') return jsonResponse(sessionResponse(true))
+      if (path === '/api/core/modules/') return jsonResponse(modulesResponse(allModules))
+      if (path === '/api/kaipanla/sectors/intraday/?inflow_top=25&outflow_top=25') {
+        return jsonResponse({
+          status: 'success',
+          business_date: '2026-09-09',
+          data_version: 'kaipanla:2026-09-09T15:00:00',
+          data: { time_points: [], series: [] },
+        })
+      }
+      throw new Error(`Unexpected request: ${path}`)
+    })
+
+    render(<App fetchImpl={fetchImpl} />)
+
+    expect(await screen.findByRole('tabpanel', { name: '开盘啦' })).toBeInTheDocument()
+    expect(screen.queryByText('数据源')).not.toBeInTheDocument()
+    expect(screen.queryByRole('navigation', { name: '板块资金流子模块' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('tab', { name: '开盘啦' })).not.toBeInTheDocument()
+    expect(screen.queryByText(/^当前模块：/)).not.toBeInTheDocument()
   })
 
   it('uses the first enabled module when Kaipanla is disabled', async () => {
@@ -109,7 +124,7 @@ describe('App shell', () => {
     const fetchImpl = vi.fn(async (path) => {
       if (path === '/api/core/session/') return jsonResponse(sessionResponse(true))
       if (path === '/api/core/modules/') return jsonResponse(modulesResponse(modules))
-      if (path === '/api/eastmoney/sectors/intraday/?inflow_top=25&outflow_top=25') {
+      if (path === '/api/stock-moves/') {
         return jsonResponse({
           status: 'error', error: { code: 'DATA_PREPARING' }, data: null,
         }, 202)
@@ -119,8 +134,9 @@ describe('App shell', () => {
 
     render(<App fetchImpl={fetchImpl} />)
 
-    expect(await screen.findByText('当前模块：东方财富')).toBeInTheDocument()
-    expect(screen.queryByRole('tab', { name: '开盘啦' })).not.toBeInTheDocument()
+    expect(await screen.findByRole('tabpanel', { name: '大涨跌幅与大成交量个股' })).toBeInTheDocument()
+    expect(await screen.findByText('数据准备中，请稍后刷新。')).toBeInTheDocument()
+    expect(screen.queryByRole('tab', { name: '板块资金流' })).not.toBeInTheDocument()
   })
 
   it('shows an explicit empty state when no business modules are enabled', async () => {
@@ -177,7 +193,6 @@ describe('App shell', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent('登录失败，请检查用户名和密码。')
   })
-})
 
   it('supports keyboard navigation between primary tabs without removing the navigation', async () => {
     const fetchImpl = vi.fn(async (path) => {
@@ -197,8 +212,9 @@ describe('App shell', () => {
     fundFlowTab.focus()
     fireEvent.keyDown(fundFlowTab, { key: 'ArrowRight' })
 
-    expect(await screen.findByText('当前模块：大涨跌幅与大成交量个股')).toBeInTheDocument()
+    expect(await screen.findByRole('tabpanel', { name: '大涨跌幅与大成交量个股' })).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: '板块资金流' })).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: '百日新高新低占比' })).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: '大涨跌幅与大成交量个股' })).toHaveAttribute('aria-selected', 'true')
   })
+})

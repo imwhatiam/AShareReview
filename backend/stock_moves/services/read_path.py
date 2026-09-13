@@ -1,80 +1,64 @@
-"""Cache-first local read and bounded local-rebuild path for stock-move results."""
+"""Cache-first reads and on-demand local generation for stock-move results.
 
-from dataclasses import dataclass
+The cache/version/fallback sequence itself lives in ``core.services.read_path``;
+this module only declares what is genuinely stock-moves': how to generate a day,
+how to serialize it, and what to warn about.
+"""
+
 from datetime import date
 
-from backend.env import get_required_setting
-from core.models import DataVersion
-from core.services.cache_keys import build_cache_key
-from core.services.file_cache import CachePayloadTooLarge, default_file_cache
+from core.services.file_cache import default_file_cache
+from core.services.locking import DatasetBusy, DatasetLocked, dataset_lock
 from core.services.market_data import (
     CompleteMarketDataUnavailable,
     get_complete_market_snapshot,
     latest_complete_stock_price_date,
 )
+from core.services.read_path import ReadPath, ReadResult  # noqa: F401
+from core.services.read_path import read as _read
+from core.services.read_path import read_dates as _read_dates
 from stock_moves.models import StockMoveItem, StockMoveResult
 from stock_moves.services.analysis import build_stock_move_analysis
+from stock_moves.services.source_versions import (
+    CompleteIndustrySnapshotUnavailable,
+    get_complete_industry_snapshot_version,
+)
 from stock_moves.services.writer import write_stock_move_analysis
 
-
-STOCK_DAILY_PRICES_DATASET = 'stock_daily_prices'
-
-
-@dataclass(frozen=True)
-class ReadResult:
-    data: dict
-    business_date: date
-    data_version: str
-    source: str
-    stale: bool = False
-    warnings: tuple[str, ...] = ()
+MODULE_ID = 'stock_moves'
+DATASET_KEY = 'stock_moves'
 
 
-def _max_local_repair_rows() -> int:
+def _local_generate(business_date: date) -> StockMoveResult:
+    """Generate one trading day's analysis from already-local core data only.
+
+    This path never synchronizes upstream data: it is a local computation over a
+    single day of prices, so there is no row budget to enforce. A request that
+    lands on a day without a stored result generates it instead of showing
+    nothing. The dataset lock keeps a concurrent request or a running
+    ``build_stock_moves`` command from writing the same day twice.
+    """
     try:
-        value = int(get_required_setting('REMOTE_REPAIR_MAX_ROWS'))
-    except ValueError as error:
-        raise ValueError('REMOTE_REPAIR_MAX_ROWS must be an integer.') from error
-    if value < 1:
-        raise ValueError('REMOTE_REPAIR_MAX_ROWS must be positive.')
-    return value
-
-
-def _latest_public_version(business_date: date) -> str | None:
-    version = DataVersion.objects.filter(
-        dataset_key=STOCK_DAILY_PRICES_DATASET,
-        business_date=business_date,
-        status=DataVersion.Status.COMPLETE,
-    ).order_by('-last_success_at', '-started_at').first()
-    return version.version if version is not None else None
-
-
-def _result_for_date(business_date: date) -> tuple[StockMoveResult | None, bool]:
-    current_version = _latest_public_version(business_date)
-    results = StockMoveResult.objects.using('stock_moves').filter(business_date=business_date)
-    if current_version is not None:
-        current_result = results.filter(
-            source_daily_price_version=current_version
-        ).order_by('-created_at').first()
-        if current_result is not None:
-            return current_result, False
-    result = results.order_by('-created_at').first()
-    return result, bool(result and current_version and result.source_daily_price_version != current_version)
-
-
-def _bounded_local_rebuild(business_date: date) -> StockMoveResult:
-    """Build from already-local core data only; this path never synchronizes upstream data."""
-    snapshot = get_complete_market_snapshot(business_date)
-    if len(snapshot.prices) > _max_local_repair_rows():
-        raise CompleteMarketDataUnavailable(
-            'The local public snapshot exceeds the web-request rebuild budget.'
-        )
-    analysis = build_stock_move_analysis(snapshot)
-    write_result = write_stock_move_analysis(
-        business_date=business_date,
-        source_daily_price_version=snapshot.data_version.version,
-        analysis=analysis,
-    )
+        with dataset_lock(MODULE_ID, DATASET_KEY):
+            snapshot = get_complete_market_snapshot(business_date)
+            try:
+                industry_version = get_complete_industry_snapshot_version()
+            except CompleteIndustrySnapshotUnavailable as error:
+                # 没有行业映射就没法写出 industries 字段，宁可"生成不了"也不要
+                # 落一份缺字段的结果（读路径会退回旧数据并标 stale）。
+                raise CompleteMarketDataUnavailable(str(error)) from error
+            analysis = build_stock_move_analysis(snapshot)
+            write_result = write_stock_move_analysis(
+                business_date=business_date,
+                source_daily_price_version=snapshot.data_version.version,
+                source_industry_version=industry_version,
+                analysis=analysis,
+            )
+    except DatasetLocked as error:
+        # 锁被占用不是"数据不可用"：调用方据此决定是返回旧数据还是 409。
+        raise DatasetBusy(
+            f'The stock-move analysis for {business_date.isoformat()} is being generated.'
+        ) from error
     return StockMoveResult.objects.using('stock_moves').get(pk=write_result.result_id)
 
 
@@ -85,7 +69,7 @@ def _serialize(result: StockMoveResult) -> dict:
             'rank': item.rank,
             'code': item.stock_code,
             'name': item.stock_name,
-            'parent_industries': item.parent_industries,
+            'industries': item.industries,
             'change_percent': item.change_percent,
             'turnover': item.turnover,
         })
@@ -97,10 +81,16 @@ def _serialize(result: StockMoveResult) -> dict:
             StockMoveItem.Group.SSE_FALL: result.sse_fall_count,
             StockMoveItem.Group.SZSE_RISE: result.szse_rise_count,
             StockMoveItem.Group.SZSE_FALL: result.szse_fall_count,
+            StockMoveItem.Group.BSE_RISE: result.bse_rise_count,
+            StockMoveItem.Group.BSE_FALL: result.bse_fall_count,
         },
-        'stock_codes': sorted({
-            item['code'] for group in groups.values() for item in group
-        }),
+        # 「全部复制」直接消费这个数组，所以顺序按页面分组顺序（上证涨/跌 → 深证涨/跌
+        # → 北交所涨/跌，组内按排名）返回 —— 用户复制出来的顺序与他看到的看板一致。
+        'stock_codes': list(dict.fromkeys(
+            item['code']
+            for group_key in StockMoveItem.Group.values
+            for item in groups[group_key]
+        )),
         'distinct_stock_count': result.distinct_stock_count,
     }
 
@@ -108,107 +98,33 @@ def _serialize(result: StockMoveResult) -> dict:
 def _warnings(result: StockMoveResult, stale: bool) -> tuple[str, ...]:
     warnings = list(result.warnings)
     if stale:
-        warnings.append('公共日行情版本已更新，正在展示最近可用的分析结果。')
+        warnings.append('公共行情或开盘啦行业映射已更新，正在展示最近可用的分析结果。')
     return tuple(dict.fromkeys(warnings))
 
 
+READ_PATH = ReadPath(
+    module_id=MODULE_ID,
+    results=lambda: StockMoveResult.objects.using('stock_moves'),
+    generate=_local_generate,
+    serialize=_serialize,
+    warnings=_warnings,
+    latest_public_date=lambda: latest_complete_stock_price_date(),
+    industry_version=lambda: get_complete_industry_snapshot_version(),
+    industry_unavailable=CompleteIndustrySnapshotUnavailable,
+    file_cache=lambda: default_file_cache(),
+    no_result_message='No stock-move analysis result is available.',
+)
+
+
 def read_stock_moves(trade_date: date | None = None) -> ReadResult:
-    """Read a derived result from cache or SQLite, optionally repairing from local core data."""
-    if trade_date is None:
-        result = StockMoveResult.objects.using('stock_moves').order_by(
-            '-business_date', '-created_at'
-        ).first()
-        if result is None:
-            trade_date = latest_complete_stock_price_date()
-            if trade_date is None:
-                raise CompleteMarketDataUnavailable('No complete public daily-price data is available.')
-            result = _bounded_local_rebuild(trade_date)
-            stale = False
-            source = 'computed'
-        else:
-            trade_date = result.business_date
-            current, stale = _result_for_date(trade_date)
-            if current is not None:
-                result = current
-            if stale:
-                try:
-                    result = _bounded_local_rebuild(trade_date)
-                    stale = False
-                    source = 'computed'
-                except CompleteMarketDataUnavailable:
-                    source = 'database'
-            else:
-                source = 'database'
-    else:
-        result, stale = _result_for_date(trade_date)
-        source = 'database'
-        if result is None or stale:
-            try:
-                result = _bounded_local_rebuild(trade_date)
-                stale = False
-                source = 'computed'
-            except CompleteMarketDataUnavailable:
-                if result is None:
-                    raise
+    """Read a derived result from cache or SQLite, generating it locally when absent.
 
-    data_version = result.source_daily_price_version
-    cache = default_file_cache()
-    key = build_cache_key(
-        'stock_moves', 'result', {'date': str(trade_date)}, data_version
-    )
-    if cache is not None and source != 'computed':
-        cached = cache.get(key, data_version)
-        if cached is not None:
-            return ReadResult(
-                cached,
-                result.business_date,
-                data_version,
-                'cache',
-                stale=stale,
-                warnings=_warnings(result, stale),
-            )
-
-    data = _serialize(result)
-    if cache is not None:
-        try:
-            cache.set(key, data, data_version)
-        except CachePayloadTooLarge:
-            pass
-    return ReadResult(
-        data,
-        result.business_date,
-        data_version,
-        source,
-        stale=stale,
-        warnings=_warnings(result, stale),
-    )
+    Wrapped in logging because this is the one path where a plain page request can
+    silently become slow (local generation) or silently serve yesterday's data
+    (stale fallback); the access log alone cannot tell those apart.
+    """
+    return _read(READ_PATH, trade_date)
 
 
 def read_dates() -> ReadResult:
-    result = StockMoveResult.objects.using('stock_moves').order_by(
-        '-business_date', '-created_at'
-    ).first()
-    if result is None:
-        raise CompleteMarketDataUnavailable('No stock-move analysis result is available.')
-    data_version = result.source_daily_price_version
-    cache = default_file_cache()
-    key = build_cache_key('stock_moves', 'dates', {}, data_version)
-    if cache is not None:
-        cached = cache.get(key, data_version)
-        if cached is not None:
-            return ReadResult(cached, result.business_date, data_version, 'cache')
-
-    data = {
-        'dates': [
-            str(value)
-            for value in StockMoveResult.objects.using('stock_moves').order_by(
-                '-business_date'
-            ).values_list('business_date', flat=True).distinct()
-        ]
-    }
-    if cache is not None:
-        try:
-            cache.set(key, data, data_version)
-        except CachePayloadTooLarge:
-            pass
-    return ReadResult(data, result.business_date, data_version, 'database')
+    return _read_dates(READ_PATH)

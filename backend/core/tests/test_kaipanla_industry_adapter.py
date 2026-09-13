@@ -1,6 +1,10 @@
+from datetime import date, datetime
 from unittest.mock import patch
 
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, TestCase
+from django.utils import timezone
+
+from core.models import TradingDay
 
 
 class FakeResponse:
@@ -43,13 +47,11 @@ class KaipanlaIndustryClientTests(SimpleTestCase):
         'KAIPANLA_INDUSTRY_PARENT_PAGE_SIZE': '2',
         'KAIPANLA_INDUSTRY_STOCK_PAGE_SIZE': '2',
         'KAIPANLA_PARENT_INDUSTRY_ACTION': 'RealRankingInfo',
-        'KAIPANLA_CHILD_INDUSTRY_ACTION': 'SonPlate_Info',
         'KAIPANLA_STOCK_LIST_ACTION': 'ZhiShuStockList_W8',
         'KAIPANLA_INDUSTRY_CONTROLLER': 'ZhiShuRanking',
         'KAIPANLA_INDUSTRY_PARENT_ORDER': '1',
         'KAIPANLA_INDUSTRY_PARENT_TYPE': '1',
         'KAIPANLA_INDUSTRY_PARENT_ZS_TYPE': '7',
-        'KAIPANLA_INDUSTRY_CHILD_SHOW': '1',
         'KAIPANLA_INDUSTRY_STOCK_ORDER': '1',
         'KAIPANLA_INDUSTRY_STOCK_TSZB': '0',
         'KAIPANLA_INDUSTRY_STOCK_OLD': '1',
@@ -71,7 +73,7 @@ class KaipanlaIndustryClientTests(SimpleTestCase):
         }
 
         with patch.dict('os.environ', settings, clear=False):
-            KaipanlaIndustryClient(transport=transport).list_parent_industries()
+            KaipanlaIndustryClient(transport=transport).list_industries()
 
         self.assertEqual(
             transport.calls[0]['url'],
@@ -90,7 +92,7 @@ class KaipanlaIndustryClientTests(SimpleTestCase):
         ])
 
         with patch.dict('os.environ', self.settings, clear=False):
-            industries = KaipanlaIndustryClient(transport=transport).list_parent_industries()
+            industries = KaipanlaIndustryClient(transport=transport).list_industries()
 
         self.assertEqual(industries, (
             {'industry_code': '801660', 'industry_name': '通信'},
@@ -115,41 +117,11 @@ class KaipanlaIndustryClientTests(SimpleTestCase):
         })
         self.assertEqual(transport.calls[1]['data']['Index'], '2')
 
-    def test_child_request_uses_configured_credentials_and_returns_actual_children(self):
-        from core.integrations.kaipanla.client import KaipanlaIndustryClient
-
-        transport = RecordingTransport([
-            FakeResponse(200, {'errcode': '0', 'List': [
-                ['801206', '光模块'],
-            ]}),
-        ])
-
-        with patch.dict('os.environ', self.settings, clear=False):
-            children = KaipanlaIndustryClient(transport=transport).list_child_industries('801660')
-
-        self.assertEqual(children, (
-            {'industry_code': '801206', 'industry_name': '光模块'},
-        ))
-        self.assertEqual(transport.calls[0]['data'], {
-            'PhoneOSNew': '1',
-            'DeviceID': 'device-id',
-            'VerSion': '5.23.0.4',
-            'apiv': 'w44',
-            'UserID': 'user-id',
-            'Token': 'token-value',
-            'a': 'SonPlate_Info',
-            'c': 'ZhiShuRanking',
-            'IsShow': '1',
-            'Date': '2026-09-08',
-            'PlateID': '801660',
-        })
-
     def test_industry_requests_allow_blank_credentials_and_omit_their_fields(self):
         from core.integrations.kaipanla.client import KaipanlaIndustryClient
 
         transport = RecordingTransport([
             FakeResponse(200, {'errcode': 0, 'list': [['801660', '通信']]}),
-            FakeResponse(200, {'errcode': 0, 'List': [['801206', '光模块']]}),
             FakeResponse(200, {'errcode': 0, 'list': [['000001', '平安银行']]}),
         ])
         settings = {
@@ -161,11 +133,10 @@ class KaipanlaIndustryClientTests(SimpleTestCase):
 
         with patch.dict('os.environ', settings, clear=False):
             client = KaipanlaIndustryClient(transport=transport)
-            client.list_parent_industries()
-            client.list_child_industries('801660')
-            client.list_stock_codes('801206')
+            client.list_industries()
+            client.list_stock_codes('801660')
 
-        self.assertEqual(len(transport.calls), 3)
+        self.assertEqual(len(transport.calls), 2)
         for call in transport.calls:
             self.assertNotIn('DeviceID', call['data'])
             self.assertNotIn('UserID', call['data'])
@@ -206,7 +177,25 @@ class KaipanlaIndustryClientTests(SimpleTestCase):
 
         with patch.dict('os.environ', self.settings, clear=False):
             with self.assertRaises(KaipanlaUnavailableError):
-                KaipanlaIndustryClient(transport=transport).list_parent_industries()
+                KaipanlaIndustryClient(transport=transport).list_industries()
+
+    def test_rejection_message_carries_the_upstream_error_code_and_reason(self):
+        """只留 "request was rejected" 会让 1020 这类参数错误无从下手。"""
+        from core.integrations.kaipanla.client import (
+            KaipanlaIndustryClient,
+            KaipanlaUnavailableError,
+        )
+
+        transport = RecordingTransport([
+            FakeResponse(200, {'errcode': 1020, 'errmsg': '参数出错'}),
+        ])
+
+        with patch.dict('os.environ', self.settings, clear=False):
+            with self.assertRaises(KaipanlaUnavailableError) as caught:
+                KaipanlaIndustryClient(transport=transport).list_industries()
+
+        self.assertIn('errcode=1020', str(caught.exception))
+        self.assertIn('参数出错', str(caught.exception))
 
     def test_malformed_stock_code_is_rejected_instead_of_persisted(self):
         from core.integrations.kaipanla.client import (
@@ -228,7 +217,7 @@ class KaipanlaIndustryClientTests(SimpleTestCase):
         from core.integrations.kaipanla.client import KaipanlaIndustryClient
 
         transport = RecordingTransport([
-            FakeResponse(200, {'errcode': 0, 'List': []}),
+            FakeResponse(200, {'errcode': 0, 'list': []}),
         ])
         settings = {**self.settings, 'KAIPANLA_REQUEST_DELAY_SECONDS': '0.25'}
 
@@ -236,6 +225,62 @@ class KaipanlaIndustryClientTests(SimpleTestCase):
             patch.dict('os.environ', settings, clear=False),
             patch('core.integrations.kaipanla.client.sleep') as sleep,
         ):
-            KaipanlaIndustryClient(transport=transport).list_child_industries('801660')
+            KaipanlaIndustryClient(transport=transport).list_industries()
 
         sleep.assert_called_once_with(0.25)
+
+
+class KaipanlaIndustryRequestDateTests(TestCase):
+    """行业历史接口只服务交易日，Date 默认值不能是本地日期。
+
+    回归：2026-09-12（周六）运行 `sync_kaipanla_industry_snapshot` 时，命令把
+    周六当作 Date 发出去，上游回 `errcode 1020 参数出错`，命令以晦涩的
+    "Kaipanla request was rejected." 失败。
+    """
+
+    settings = {**KaipanlaIndustryClientTests.settings, 'KAIPANLA_INDUSTRY_DATE': ''}
+
+    def setUp(self):
+        TradingDay.objects.bulk_create([
+            TradingDay(trade_date=value)
+            for value in (date(2026, 9, 10), date(2026, 9, 11))
+        ])
+
+    def _request_date_at(self, *parts):
+        from core.integrations.kaipanla.client import KaipanlaIndustryClient
+
+        transport = RecordingTransport([
+            FakeResponse(200, {'errcode': 0, 'list': [['801660', '通信']]}),
+        ])
+        moment = timezone.make_aware(datetime(*parts))
+        with (
+            patch.dict('os.environ', self.settings, clear=False),
+            patch('django.utils.timezone.now', return_value=moment),
+        ):
+            KaipanlaIndustryClient(transport=transport).list_industries()
+        return transport.calls[0]['data']['Date']
+
+    def test_trading_day_query_uses_that_same_day(self):
+        self.assertEqual(self._request_date_at(2026, 9, 10, 10, 0), '2026-09-10')
+
+    def test_weekend_query_falls_back_to_the_latest_trading_day(self):
+        self.assertEqual(self._request_date_at(2026, 9, 12, 9, 30), '2026-09-11')
+
+    def test_configured_date_still_overrides_the_fallback(self):
+        from core.integrations.kaipanla.client import KaipanlaIndustryClient
+
+        transport = RecordingTransport([
+            FakeResponse(200, {'errcode': 0, 'list': [['801660', '通信']]}),
+        ])
+        settings = {**self.settings, 'KAIPANLA_INDUSTRY_DATE': '2026-09-09'}
+
+        with (
+            patch.dict('os.environ', settings, clear=False),
+            patch(
+                'django.utils.timezone.now',
+                return_value=timezone.make_aware(datetime(2026, 9, 12, 9, 30)),
+            ),
+        ):
+            KaipanlaIndustryClient(transport=transport).list_industries()
+
+        self.assertEqual(transport.calls[0]['data']['Date'], '2026-09-09')

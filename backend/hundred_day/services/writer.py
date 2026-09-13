@@ -27,6 +27,19 @@ def new_source_batch_id() -> str:
     return uuid4().hex
 
 
+def _serialize_stocks(stocks) -> list[dict]:
+    """把明细转成 JSON 可存的形式；Decimal 必须先转字符串，JSONField 存不了 Decimal。"""
+    return [
+        {
+            'code': stock.stock_code,
+            'name': stock.stock_name,
+            'change_percent': None if stock.change_percent is None else str(stock.change_percent),
+            'turnover': None if stock.turnover is None else str(stock.turnover),
+        }
+        for stock in stocks
+    ]
+
+
 def write_hundred_day_analysis(
     *, analysis: HundredDayAnalysis, source_batch_id: str | None = None
 ) -> HundredDayWriteResult:
@@ -59,7 +72,7 @@ def write_hundred_day_analysis(
                     result=result,
                     stock_code=flag.stock_code,
                     stock_name=flag.stock_name,
-                    parent_industries=list(flag.parent_industries),
+                    industries=list(flag.industries),
                     is_new_high=flag.is_new_high,
                     is_new_low=flag.is_new_low,
                 )
@@ -73,8 +86,8 @@ def write_hundred_day_analysis(
                     stock_count=summary.stock_count,
                     new_high_count=summary.new_high_count,
                     new_low_count=summary.new_low_count,
-                    new_high_stocks=list(summary.new_high_stocks),
-                    new_low_stocks=list(summary.new_low_stocks),
+                    new_high_stocks=_serialize_stocks(summary.new_high_stocks),
+                    new_low_stocks=_serialize_stocks(summary.new_low_stocks),
                 )
                 for summary in analysis.industry_summaries
             ])

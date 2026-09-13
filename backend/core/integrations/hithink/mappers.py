@@ -5,14 +5,18 @@ from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
 from core.integrations.hithink.contracts import (
+    HithinkIndustryIndex,
     HithinkPayloadError,
     HithinkPriceBar,
+    HithinkQuoteSnapshot,
     HithinkTicker,
 )
 
 
 _SHANGHAI = ZoneInfo('Asia/Shanghai')
 _EXCHANGES = {'SH': 'sse', 'SZ': 'szse', 'BJ': 'bse'}
+# 同花顺指数的市场后缀；只接受它才能保证拿到的是同花顺行业板块而不是交易所指数。
+_INDEX_MARKET_SUFFIX = 'TI'
 
 
 def _required_string(item: dict, field: str) -> str:
@@ -105,3 +109,44 @@ def map_price_bar(item: dict) -> HithinkPriceBar:
         volume=_integer_or_none(item, 'volume'),
         turnover=_decimal_or_none(item, 'turnover'),
     )
+
+
+def map_quote_snapshot(item: dict) -> HithinkQuoteSnapshot:
+    """Map one whole-market snapshot row.
+
+    A suspended stock legitimately arrives as ``last_price: null``, so the price
+    fields stay ``None`` here instead of raising — the service layer turns that
+    into ``has_valid_trade=False``.
+    """
+    if not isinstance(item, dict):
+        raise HithinkPayloadError('Upstream quote snapshot item is invalid.')
+    return HithinkQuoteSnapshot(
+        thscode=_required_string(item, 'thscode'),
+        stock_code=_required_string(item, 'ticker'),
+        last_price=_decimal_or_none(item, 'last_price'),
+        open_price=_decimal_or_none(item, 'open_price'),
+        high_price=_decimal_or_none(item, 'high_price'),
+        low_price=_decimal_or_none(item, 'low_price'),
+        volume=_integer_or_none(item, 'volume'),
+        turnover=_decimal_or_none(item, 'turnover'),
+    )
+
+
+def map_industry_index(item: dict) -> HithinkIndustryIndex:
+    if not isinstance(item, dict):
+        raise HithinkPayloadError('Upstream industry index item is invalid.')
+    thscode = _required_string(item, 'thscode')
+    industry_code, separator, market = thscode.partition('.')
+    if not industry_code or separator != '.' or market != _INDEX_MARKET_SUFFIX:
+        raise HithinkPayloadError('Upstream industry index thscode is invalid.')
+    return HithinkIndustryIndex(
+        thscode=thscode,
+        industry_code=industry_code,
+        industry_name=_required_string(item, 'name'),
+    )
+
+
+def map_industry_constituent(item: dict) -> str:
+    if not isinstance(item, dict):
+        raise HithinkPayloadError('Upstream industry constituent item is invalid.')
+    return _required_string(item, 'ticker')

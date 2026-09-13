@@ -6,6 +6,7 @@ from unittest.mock import patch
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 
+from core.models import DataVersion
 from core.services.file_cache import FileCache
 from stock_moves.models import StockMoveItem, StockMoveResult
 
@@ -18,15 +19,23 @@ class StockMovesApiTests(TestCase):
         self.user = get_user_model().objects.create_user(
             username='stock-moves-user', password='correct-password'
         )
+        DataVersion.objects.create(
+            dataset_key='industry_snapshot',
+            version='industries-20260908-v1',
+            status=DataVersion.Status.COMPLETE,
+            expected_record_count=1,
+            actual_record_count=1,
+        )
         self.result = StockMoveResult.objects.using('stock_moves').create(
             business_date=self.trade_date,
             source_daily_price_version='daily-prices-20260908-v1',
+            source_industry_version='industries-20260908-v1',
             sse_rise_count=1,
             sse_fall_count=0,
             szse_rise_count=1,
             szse_fall_count=0,
             distinct_stock_count=2,
-            warnings=['股票 000001 未映射到开盘啦父行业。'],
+            warnings=['股票 000001 未映射到开盘啦板块。'],
         )
         StockMoveItem.objects.using('stock_moves').bulk_create([
             StockMoveItem(
@@ -35,7 +44,7 @@ class StockMovesApiTests(TestCase):
                 rank=1,
                 stock_code='600001',
                 stock_name='上证上涨',
-                parent_industries=[{'code': 'I001', 'name': '银行'}],
+                industries=[{'code': 'I001', 'name': '银行'}],
                 change_percent=Decimal('9'),
                 turnover=Decimal('900000000'),
             ),
@@ -45,7 +54,7 @@ class StockMovesApiTests(TestCase):
                 rank=1,
                 stock_code='000001',
                 stock_name='深证上涨',
-                parent_industries=[],
+                industries=[],
                 change_percent=Decimal('8'),
                 turnover=Decimal('800000000'),
             ),
@@ -74,20 +83,76 @@ class StockMovesApiTests(TestCase):
         self.assertEqual(first.status_code, 200)
         self.assertEqual(first.json()['status'], 'partial')
         self.assertEqual(first.json()['business_date'], '2026-09-08')
-        self.assertEqual(first.json()['data_version'], 'daily-prices-20260908-v1')
+        self.assertEqual(first.json()['data_version'], 'daily-prices-20260908-v1:industries-20260908-v1')
         self.assertEqual(first.json()['source'], 'database')
         self.assertEqual(
             first.json()['data']['group_counts'],
-            {'sse_rise': 1, 'sse_fall': 0, 'szse_rise': 1, 'szse_fall': 0},
+            {
+                'sse_rise': 1, 'sse_fall': 0,
+                'szse_rise': 1, 'szse_fall': 0,
+                'bse_rise': 0, 'bse_fall': 0,
+            },
         )
-        self.assertEqual(first.json()['data']['stock_codes'], ['000001', '600001'])
+        # 顺序跟页面分组一致（上证上涨 → 深证上涨），不是字典序。
+        self.assertEqual(first.json()['data']['stock_codes'], ['600001', '000001'])
         self.assertEqual(
-            first.json()['data']['groups']['sse_rise'][0]['parent_industries'],
+            first.json()['data']['groups']['sse_rise'][0]['industries'],
             [{'code': 'I001', 'name': '银行'}],
         )
         self.assertEqual(second.status_code, 200)
         self.assertEqual(second.json()['source'], 'cache')
         self.assertEqual(second.json()['data'], first.json()['data'])
+
+    @patch('stock_moves.services.read_path.default_file_cache')
+    def test_bse_groups_are_returned_after_the_four_exchange_groups_and_copied_too(
+        self, cache_factory
+    ):
+        cache_factory.return_value = self.cache
+        StockMoveItem.objects.using('stock_moves').bulk_create([
+            StockMoveItem(
+                result=self.result,
+                group=StockMoveItem.Group.BSE_RISE,
+                rank=1,
+                stock_code='920045',
+                stock_name='蘅东光',
+                industries=[{'code': 'I007', 'name': '通信'}],
+                change_percent=Decimal('9.81'),
+                turnover=Decimal('1218000000'),
+            ),
+            StockMoveItem(
+                result=self.result,
+                group=StockMoveItem.Group.BSE_FALL,
+                rank=1,
+                stock_code='920046',
+                stock_name='蘅西光',
+                industries=[],
+                change_percent=Decimal('-8.42'),
+                turnover=Decimal('900000000'),
+            ),
+        ])
+        StockMoveResult.objects.using('stock_moves').filter(pk=self.result.pk).update(
+            bse_rise_count=1,
+            bse_fall_count=1,
+            distinct_stock_count=4,
+        )
+
+        response = self._authenticated_client().get('/api/stock-moves/?date=2026-09-08')
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()['data']
+        self.assertEqual(data['group_counts']['bse_rise'], 1)
+        self.assertEqual(data['group_counts']['bse_fall'], 1)
+        self.assertEqual(
+            [(item['code'], item['name']) for item in data['groups']['bse_rise']],
+            [('920045', '蘅东光')],
+        )
+        self.assertEqual(
+            [(item['code'], item['name']) for item in data['groups']['bse_fall']],
+            [('920046', '蘅西光')],
+        )
+        self.assertEqual(data['distinct_stock_count'], 4)
+        # 北交所股票计入「全部复制」，且追加在四组之后（先涨后跌）。
+        self.assertEqual(data['stock_codes'], ['600001', '000001', '920045', '920046'])
 
     def test_explicit_invalid_or_unavailable_dates_are_rejected_without_silent_fallback(self):
         client = self._authenticated_client()
@@ -106,6 +171,7 @@ class StockMovesApiTests(TestCase):
         StockMoveResult.objects.using('stock_moves').create(
             business_date=date(2026, 9, 7),
             source_daily_price_version='daily-prices-20260907-v1',
+            source_industry_version='industries-20260907-v1',
         )
 
         response = self._authenticated_client().get('/api/stock-moves/dates/')

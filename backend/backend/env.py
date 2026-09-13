@@ -1,6 +1,7 @@
 """Small, dependency-free reader for the repository root .env file."""
 
 import os
+import time
 from pathlib import Path
 
 from django.core.exceptions import ImproperlyConfigured
@@ -8,14 +9,27 @@ from django.core.exceptions import ImproperlyConfigured
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 ENV_FILE = REPOSITORY_ROOT / '.env'
+# 每条配置都重新解析一次 .env 是纯浪费：一个管理命令会问近 200 次配置，在文件
+# I/O 昂贵的地方（容器、网络盘、沙箱代理）这些读取会直接主导运行时长。这里按
+# 路径缓存解析结果，并最多每 TTL 秒比对一次文件指纹，所以进程长跑期间改 .env
+# 仍会生效，只是延迟不超过 TTL。
+ENV_CACHE_TTL_SECONDS = 5.0
+
+_PARSE_CACHE: dict[Path, tuple[float, tuple[int, int] | None, dict[str, str]]] = {}
 
 
-def _file_values() -> dict[str, str]:
-    if not ENV_FILE.exists():
-        return {}
+def _fingerprint(path: Path) -> tuple[int, int] | None:
+    """Return ``(mtime_ns, size)``, or ``None`` when the file is unreadable."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
 
+
+def _parse(text: str) -> dict[str, str]:
     values: dict[str, str] = {}
-    for raw_line in ENV_FILE.read_text(encoding='utf-8').splitlines():
+    for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line or line.startswith('#') or '=' not in line:
             continue
@@ -30,8 +44,29 @@ def _file_values() -> dict[str, str]:
     return values
 
 
+def _file_values() -> dict[str, str]:
+    path = ENV_FILE
+    now = time.monotonic()
+    cached = _PARSE_CACHE.get(path)
+    if cached is not None and now - cached[0] < ENV_CACHE_TTL_SECONDS:
+        return cached[2]
+
+    fingerprint = _fingerprint(path)
+    if fingerprint is not None and cached is not None and cached[1] == fingerprint:
+        # 文件没变，只刷新“检查时间”，继续复用已解析的结果。
+        _PARSE_CACHE[path] = (now, fingerprint, cached[2])
+        return cached[2]
+
+    values = {} if fingerprint is None else _parse(path.read_text(encoding='utf-8'))
+    _PARSE_CACHE[path] = (now, fingerprint, values)
+    return values
+
+
 def get_setting(name: str, default: str | None = None) -> str | None:
-    return os.environ.get(name, _file_values().get(name, default))
+    value = os.environ.get(name)
+    if value is not None:
+        return value
+    return _file_values().get(name, default)
 
 
 def get_required_setting(name: str) -> str:
@@ -55,9 +90,30 @@ def get_bool_setting(name: str, default: bool = False) -> bool:
     )
 
 
-def get_list_setting(name: str, default: tuple[str, ...] = ()) -> list[str]:
+def get_int_setting(name: str, default: int) -> int:
+    """Read a whole-number setting, rejecting anything that is not an integer."""
     value = get_setting(name)
-    if value is None:
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value.strip())
+    except ValueError as error:
+        raise ImproperlyConfigured(
+            f'Setting {name} must be an integer, not {value!r}.'
+        ) from error
+
+
+def get_list_setting(name: str, default: tuple[str, ...] = ()) -> list[str]:
+    """Read a comma-separated setting, falling back to ``default`` when unset.
+
+    A missing value **and a blank value** both mean "not configured": ``''``,
+    ``'   '`` and ``ENABLED_MODULES=`` all resolve to ``default``. Treating a
+    blank value as an explicit empty list is how a single stray ``=`` line
+    silently disabled every business module (and could not be caught by the
+    unknown-ID validation, which only sees an empty set).
+    """
+    value = get_setting(name)
+    if value is None or not value.strip():
         return list(default)
     return [item.strip() for item in value.split(',') if item.strip()]
 

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 
 import { createApiClient } from './api/client'
 import AuthGate from './app/AuthGate'
@@ -9,13 +9,30 @@ import {
   getModuleComponent,
   navigationIdForModule,
 } from './app/moduleRegistry'
+import Icon from './shared/ui/Icon'
+import TabBar from './shared/ui/TabBar'
 
-function AppShell({ apiClient }) {
+const PRIMARY_NAV_LABEL = '一级功能模块'
+const PANEL_ID = 'active-module-panel'
+
+function AppBrand() {
+  return (
+    <div className="app__brand">
+      <span className="app__brand-mark">
+        <Icon name="brand" size={20} />
+      </span>
+      <div className="app__brand-text">
+        <h1 className="app__brand-title">A 股市场复盘</h1>
+        <p className="app__brand-subtitle">板块资金流 · 盘后结构分析</p>
+      </div>
+    </div>
+  )
+}
+
+function AppShell({ apiClient, session }) {
   const [modules, setModules] = useState(null)
   const [selectedModuleId, setSelectedModuleId] = useState(null)
   const [loadError, setLoadError] = useState(null)
-  const primaryTabRefs = useRef(new Map())
-  const fundFlowTabRefs = useRef(new Map())
 
   useEffect(() => {
     let active = true
@@ -37,13 +54,25 @@ function AppShell({ apiClient }) {
   }, [apiClient])
 
   if (loadError) {
-    return <main role="alert">{loadError}</main>
+    return (
+      <div className="app">
+        <main className="app__main" role="alert">{loadError}</main>
+      </div>
+    )
   }
   if (modules === null) {
-    return <main role="status">正在加载模块…</main>
+    return (
+      <div className="app">
+        <main className="app__main" role="status">正在加载模块…</main>
+      </div>
+    )
   }
   if (modules.length === 0) {
-    return <main role="status">暂无已启用模块</main>
+    return (
+      <div className="app">
+        <main className="app__main" role="status">暂无已启用模块</main>
+      </div>
+    )
   }
 
   const activeModule = modules.find((module) => module.id === selectedModuleId)
@@ -51,96 +80,55 @@ function AppShell({ apiClient }) {
   const navigation = buildNavigation(modules)
   const activeNavigationId = navigationIdForModule(activeModule)
   const ActiveModuleComponent = getModuleComponent(activeModule.id)
-  const fundFlowModules = modules.filter(
-    (module) => module.navigation_group === 'fund_flow',
-  )
+  const primaryItems = navigation
+  const username = session?.user?.username
 
   function selectNavigation(item) {
     const currentModuleIsInItem = item.moduleIds.includes(activeModule.id)
     setSelectedModuleId(currentModuleIsInItem ? activeModule.id : item.moduleIds[0])
   }
 
-  function moveTab(event, items, currentIndex, onSelect, refs) {
-    const keys = { ArrowRight: 1, ArrowLeft: -1 }
-    let nextIndex
-    if (event.key === 'Home') nextIndex = 0
-    else if (event.key === 'End') nextIndex = items.length - 1
-    else if (keys[event.key]) {
-      nextIndex = (currentIndex + keys[event.key] + items.length) % items.length
-    } else {
-      return
-    }
-    event.preventDefault()
-    const nextItem = items[nextIndex]
-    onSelect(nextItem)
-    requestAnimationFrame(() => refs.current.get(nextItem.id)?.focus())
-  }
-
   return (
-    <>
-      <header>
-        <h1>A 股市场复盘</h1>
-        <nav aria-label="功能模块">
-          <div role="tablist" aria-label="一级功能模块">
-            {navigation.map((item) => (
-              <button
-                key={item.id}
-                type="button"
-                role="tab"
-                aria-selected={activeNavigationId === item.id}
-                aria-controls="active-module-panel"
-                tabIndex={activeNavigationId === item.id ? 0 : -1}
-                ref={(element) => {
-                  if (element) primaryTabRefs.current.set(item.id, element)
-                  else primaryTabRefs.current.delete(item.id)
-                }}
-                onClick={() => selectNavigation(item)}
-                onKeyDown={(event) => moveTab(
-                  event, navigation, navigation.indexOf(item), selectNavigation, primaryTabRefs,
-                )}
-              >
-                {item.label}
-              </button>
-            ))}
-          </div>
-        </nav>
-        {activeNavigationId === 'fund_flow' && (
-          <nav aria-label="板块资金流子模块">
-            <div role="tablist" aria-label="板块资金流子模块">
-              {fundFlowModules.map((module) => (
-                <button
-                  key={module.id}
-                  type="button"
-                  role="tab"
-                  aria-selected={activeModule.id === module.id}
-                  aria-controls="active-module-panel"
-                  tabIndex={activeModule.id === module.id ? 0 : -1}
-                  ref={(element) => {
-                    if (element) fundFlowTabRefs.current.set(module.id, element)
-                    else fundFlowTabRefs.current.delete(module.id)
-                  }}
-                  onClick={() => setSelectedModuleId(module.id)}
-                  onKeyDown={(event) => moveTab(
-                    event, fundFlowModules, fundFlowModules.indexOf(module),
-                    (item) => setSelectedModuleId(item.id), fundFlowTabRefs,
-                  )}
-                >
-                  {module.display_name}
-                </button>
-              ))}
+    <div className="app">
+      <header className="app__header">
+        <div className="app__bar">
+          <AppBrand />
+          {username && (
+            <div className="user-chip">
+              <span className="user-chip__avatar">{username.slice(0, 1).toUpperCase()}</span>
+              <span className="user-chip__name">{username}</span>
             </div>
-          </nav>
-        )}
+          )}
+        </div>
+
+        <div className="app__nav">
+          <TabBar
+            items={primaryItems}
+            activeId={activeNavigationId}
+            onSelect={selectNavigation}
+            label={PRIMARY_NAV_LABEL}
+            panelId={PANEL_ID}
+          />
+        </div>
       </header>
-      <main id="active-module-panel" role="tabpanel" aria-label={activeModule.display_name}>
-        <p>当前模块：{activeModule.display_name}</p>
+
+      {/*
+       * 面板的可访问名用 `aria-label` 而不是 `aria-labelledby` 指向选中的 tab：
+       * 控制它的那个 tab 挂的是**导航分组**名（"板块资金流"），而面板里呈现的是
+       * 具体模块（"开盘啦"）。指向 tab 会把面板的名字换成更笼统的分组名，读屏用户
+       * 反而听不出自己进了哪一页。tab → 面板的关系由 tab 上的 `aria-controls`
+       * 与漫游 tabindex 建立，不需要再靠名字建立一次。
+       */}
+      <main className="app__main" id={PANEL_ID} role="tabpanel" aria-label={activeModule.display_name}>
         {ActiveModuleComponent ? (
           <ActiveModuleComponent apiClient={apiClient} />
         ) : (
-          <p>页面内容将在后续步骤接入。</p>
+          <p className="empty-note">页面内容将在后续步骤接入。</p>
         )}
       </main>
-    </>
+
+      <footer className="app__footer">京ICP备2024096986号-1</footer>
+    </div>
   )
 }
 
@@ -156,7 +144,7 @@ export default function App({ fetchImpl }) {
 
   return (
     <AuthGate apiClient={apiClient} authRevision={authRevision}>
-      {() => <AppShell apiClient={apiClient} />}
+      {(session) => <AppShell apiClient={apiClient} session={session} />}
     </AuthGate>
   )
 }

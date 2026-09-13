@@ -1,37 +1,26 @@
-import { useEffect, useRef } from 'react'
-import * as echarts from 'echarts'
+import { useMemo } from 'react'
 
-function chartSeries(series) {
-  return series.map((item) => ({
-    name: item.name,
-    type: 'line',
-    showSymbol: true,
-    connectNulls: false,
-    data: item.data,
-    lineStyle: {
-      color: item.latest_net_inflow >= 0 ? '#c62828' : '#008a4c',
-    },
-  }))
-}
+import useChart from '../../shared/charts/useChart'
+import { flowOption } from '../../shared/charts/chartTheme'
 
 export default function HistoryChart({ timePoints, series }) {
-  const containerRef = useRef(null)
+  const option = useMemo(
+    () => flowOption({
+      timePoints,
+      series,
+      yAxisName: '净流入（亿）',
+      showSymbol: true,
+    }),
+    [series, timePoints],
+  )
+  const containerRef = useChart(option)
 
-  useEffect(() => {
-    const chart = echarts.init(containerRef.current)
-    const resizeChart = () => chart.resize()
-    window.addEventListener('resize', resizeChart)
-    chart.setOption({
-      tooltip: { trigger: 'axis' },
-      xAxis: { type: 'category', boundaryGap: false, data: timePoints },
-      yAxis: { type: 'value', name: '净流入（亿）' },
-      series: chartSeries(series),
-    })
-    return () => {
-      window.removeEventListener('resize', resizeChart)
-      chart.dispose()
-    }
-  }, [series, timePoints])
-
-  return <div ref={containerRef} aria-label="多日资金流图" style={{ height: 360 }} />
+  return (
+    <div
+      ref={containerRef}
+      className="chart"
+      aria-label="多日资金流图"
+      style={{ height: 380 }}
+    />
+  )
 }

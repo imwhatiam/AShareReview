@@ -7,7 +7,7 @@ from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.test import TestCase
 
-from core.services.contracts import MarketDataVersion, ParentIndustry
+from core.services.contracts import MarketDataVersion, Industry
 from core.services.market_data import CompleteMarketDataUnavailable
 from hundred_day.models import (
     HundredDayIndustrySummary,
@@ -16,7 +16,11 @@ from hundred_day.models import (
     HundredDayStockFlag,
     HundredDayTrend,
 )
-from hundred_day.services.analysis import HistoricalCloseData, InsufficientHundredDayHistory
+from hundred_day.services.analysis import (
+    HistoricalCloseData,
+    InsufficientHundredDayHistory,
+    TargetDayQuote,
+)
 
 
 class BuildHundredDayCommandTests(TestCase):
@@ -35,7 +39,8 @@ class BuildHundredDayCommandTests(TestCase):
                 '600001': {day: Decimal('10') for day in days[:-1]} | {days[-1]: Decimal('11')},
             },
             stock_names_by_code={'600001': '上涨股票'},
-            parent_industries=(ParentIndustry('I001', '电子', ('600001',)),),
+            industries=(Industry('I001', '电子', ('600001',)),),
+            target_day_quotes={'600001': TargetDayQuote(Decimal('10'), Decimal('1000000'))},
         )
 
     @patch('hundred_day.management.commands.build_hundred_day.get_complete_industry_snapshot_version')

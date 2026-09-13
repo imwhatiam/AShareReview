@@ -1,12 +1,12 @@
 from datetime import date, datetime
 
 from core.models import DailyPrice, DataVersion, IndustrySnapshot
-from core.services.calendar import latest_eligible_trading_day
+from core.services.calendar import latest_eligible_trading_day, to_shanghai_date
 from core.services.contracts import (
     CompleteMarketSnapshot,
+    Industry,
     MarketDataVersion,
     MarketPrice,
-    ParentIndustry,
 )
 
 
@@ -18,19 +18,48 @@ class CompleteMarketDataUnavailable(LookupError):
 
 
 def latest_complete_stock_price_date(now: datetime | None = None) -> date | None:
+    """Return the trading day the default page entry should read.
+
+    ``latest_eligible_trading_day`` answers "has the *current* session closed",
+    which is what the post-close pipeline needs, so before 15:00 it deliberately
+    steps back one day. A page needs a different question answered: "is there a
+    complete version for today yet". An intraday refresh publishes exactly such
+    a version, and once one exists the default entry must follow today —
+    otherwise the store is being updated every half hour while every page keeps
+    showing yesterday.
+
+    The upper bound is only relaxed when today already carries a complete
+    version, so before the first intraday refresh (and on every non-trading day)
+    the behaviour is unchanged.
+    """
     eligible_day = latest_eligible_trading_day(now)
     if eligible_day is None:
         return None
+    today = to_shanghai_date(now)
+    if eligible_day >= today:
+        upper_bound = eligible_day
+    elif _has_complete_version(today):
+        upper_bound = today
+    else:
+        upper_bound = eligible_day
     version = (
         DataVersion.objects.filter(
             dataset_key=STOCK_DAILY_PRICES_DATASET,
             status=DataVersion.Status.COMPLETE,
-            business_date__lte=eligible_day,
+            business_date__lte=upper_bound,
         )
         .order_by('-business_date', '-last_success_at', '-started_at')
         .first()
     )
     return version.business_date if version is not None else None
+
+
+def _has_complete_version(business_date: date) -> bool:
+    return DataVersion.objects.filter(
+        dataset_key=STOCK_DAILY_PRICES_DATASET,
+        status=DataVersion.Status.COMPLETE,
+        business_date=business_date,
+    ).exists()
 
 
 def get_complete_market_snapshot(business_date: date) -> CompleteMarketSnapshot:
@@ -70,15 +99,13 @@ def get_complete_market_snapshot(business_date: date) -> CompleteMarketSnapshot:
             source_data_version=version.version,
         ).select_related('stock')
     )
-    parent_industries = tuple(
-        ParentIndustry(
+    industries = tuple(
+        Industry(
             code=industry.industry_code,
             name=industry.industry_name,
             stock_codes=tuple(industry.stock_codes),
         )
-        for industry in IndustrySnapshot.objects.filter(
-            industry_level=IndustrySnapshot.Level.PARENT
-        )
+        for industry in IndustrySnapshot.objects.all()
     )
     return CompleteMarketSnapshot(
         data_version=MarketDataVersion(
@@ -86,5 +113,5 @@ def get_complete_market_snapshot(business_date: date) -> CompleteMarketSnapshot:
             business_date=version.business_date,
         ),
         prices=prices,
-        parent_industries=parent_industries,
+        industries=industries,
     )

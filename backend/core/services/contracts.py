@@ -28,7 +28,7 @@ class MarketPrice:
 
 
 @dataclass(frozen=True)
-class ParentIndustry:
+class Industry:
     code: str
     name: str
     stock_codes: tuple[str, ...]
@@ -38,4 +38,4 @@ class ParentIndustry:
 class CompleteMarketSnapshot:
     data_version: MarketDataVersion
     prices: tuple[MarketPrice, ...]
-    parent_industries: tuple[ParentIndustry, ...]
+    industries: tuple[Industry, ...]

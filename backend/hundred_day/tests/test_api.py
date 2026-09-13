@@ -13,6 +13,7 @@ from hundred_day.models import (
     HundredDayStockFlag,
     HundredDayTrend,
 )
+from hundred_day.services.analysis import InsufficientHundredDayHistory
 
 
 class HundredDayApiTests(TestCase):
@@ -35,7 +36,7 @@ class HundredDayApiTests(TestCase):
             result=self.result,
             stock_code='600001',
             stock_name='测试股票',
-            parent_industries=[{'code': 'I001', 'name': '电子'}],
+            industries=[{'code': 'I001', 'name': '电子'}],
             is_new_high=True,
         )
         HundredDayIndustrySummary.objects.using('hundred_day').create(
@@ -44,7 +45,10 @@ class HundredDayApiTests(TestCase):
             industry_name='电子',
             stock_count=1,
             new_high_count=1,
-            new_high_stocks=[{'code': '600001', 'name': '测试股票'}],
+            new_high_stocks=[{
+                'code': '600001', 'name': '测试股票',
+                'change_percent': '10.000000', 'turnover': '123456789.0000',
+            }],
         )
         HundredDayTrend.objects.using('hundred_day').create(
             result=self.result,
@@ -103,6 +107,23 @@ class HundredDayApiTests(TestCase):
         self.assertEqual(malformed.json()['error']['code'], 'INVALID_DATE')
         self.assertEqual(unavailable.status_code, 404)
         self.assertEqual(unavailable.json()['error']['code'], 'DATA_NOT_AVAILABLE')
+
+    @patch(
+        'hundred_day.views.read_hundred_day',
+        side_effect=InsufficientHundredDayHistory('需要 199 个交易日的行情。'),
+    )
+    def test_insufficient_history_is_404_for_an_explicit_date_and_202_by_default(self, read):
+        """历史不足对历史日期永远不会自愈：202 只会让前端一直重试。"""
+        client = self._authenticated_client()
+
+        explicit = client.get('/api/hundred-day/?date=2026-09-08')
+        default = client.get('/api/hundred-day/')
+
+        self.assertEqual(explicit.status_code, 404)
+        self.assertEqual(explicit.json()['error']['code'], 'INSUFFICIENT_HISTORY')
+        self.assertEqual(default.status_code, 202)
+        self.assertEqual(default.json()['error']['code'], 'INSUFFICIENT_HISTORY')
+        self.assertEqual(default.json()['preparation']['state'], 'insufficient_history')
 
     @patch('hundred_day.services.read_path.default_file_cache')
     def test_dates_lists_distinct_available_result_dates(self, cache_factory):

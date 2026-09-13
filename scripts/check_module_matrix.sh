@@ -13,7 +13,6 @@ cd "${BACKEND_ROOT}"
 command_for_module() {
     case "$1" in
         kaipanla) echo 'fetch_kaipanla_sector_fund_flow' ;;
-        eastmoney) echo 'fetch_eastmoney_sector_fund_flow' ;;
         stock_moves) echo 'build_stock_moves' ;;
         sector_momentum) echo 'build_sector_momentum' ;;
         hundred_day) echo 'build_hundred_day' ;;
@@ -26,7 +25,7 @@ command_for_module() {
 
 route_for_module() {
     case "$1" in
-        kaipanla|eastmoney) echo 'sectors/' ;;
+        kaipanla) echo 'sectors/' ;;
         stock_moves|sector_momentum|hundred_day) echo '' ;;
         *)
             echo "Unknown module: $1" >&2
@@ -35,7 +34,7 @@ route_for_module() {
     esac
 }
 
-for module in kaipanla eastmoney stock_moves sector_momentum hundred_day; do
+for module in kaipanla stock_moves sector_momentum hundred_day; do
     command_name="$(command_for_module "${module}")"
     route_suffix="$(route_for_module "${module}")"
     echo "== ${module}: Django configuration =="
@@ -51,7 +50,7 @@ for module in kaipanla eastmoney stock_moves sector_momentum hundred_day; do
 from django.urls import Resolver404, resolve
 match = resolve('/api/${module//_/-}/${route_suffix}')
 assert match.namespace == '${module}', match.namespace
-for disabled in {'kaipanla', 'eastmoney', 'stock_moves', 'sector_momentum', 'hundred_day'} - {'${module}'}:
+for disabled in {'kaipanla', 'stock_moves', 'sector_momentum', 'hundred_day'} - {'${module}'}:
     try:
         resolve('/api/' + disabled.replace('_', '-') + '/')
     except Resolver404:
@@ -67,7 +66,6 @@ done
 if [[ "${RUN_UPSTREAM_DRY_RUNS:-0}" == '1' ]]; then
     echo '== approved upstream dry-run checks =='
     ENABLED_MODULES=kaipanla "${PYTHON_BIN}" manage.py fetch_kaipanla_sector_fund_flow --latest --dry-run
-    ENABLED_MODULES=eastmoney "${PYTHON_BIN}" manage.py fetch_eastmoney_sector_fund_flow --latest --dry-run
 else
     echo 'Skipped upstream dry-runs (set RUN_UPSTREAM_DRY_RUNS=1 only after explicit approval).'
 fi

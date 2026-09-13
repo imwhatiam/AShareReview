@@ -47,6 +47,43 @@ class KaipanlaSectorFundFlowFetcherTests(SimpleTestCase):
         self.assertEqual([row.sector_code for row in result.rows], ['BK001', 'BK002'])
         self.assertEqual(result.rows[0].main_net_inflow, Decimal('21'))
 
+    def test_unparsable_rows_are_counted_instead_of_silently_dropped(self):
+        """坏行必须留下数字：以前它被静默跳过，快照照样标 complete。
+
+        板块可以整整一批消失，而运维唯一能看的 ``missing_record_count`` 恒为 0。
+        现在每条坏行进 ``invalid_row_count``，上游 ``Count`` 进
+        ``upstream_record_count``，两者之差就是"上游说有、我们没用上"的行数。
+        """
+        from kaipanla.services.fetcher import KaipanlaSectorFundFlowFetcher
+
+        client = Mock()
+        client.fetch_page.side_effect = (
+            {
+                'errcode': 0,
+                'Count': 3,
+                'Day': ['2026-09-08'],
+                'Time': 1788852300,
+                'list': [
+                    ['BK001', '半导体', 0, '1.2', 0, '100', '20', '30', '10', '1.1', '50', 0, '4', '60'],
+                    # 长度不足 14：解析不出来
+                    ['BK002', '通信设备', 0, '2.2'],
+                    # 没有主力净流入：也被判为坏行
+                    ['BK003', '证券', 0, '3.2', 0, '300', '-', '30', '10', '1.1', '50', 0, '4', '60'],
+                ],
+            },
+        )
+
+        result = KaipanlaSectorFundFlowFetcher(
+            client=client,
+            page_size=80,
+            max_retries=0,
+        ).fetch()
+
+        self.assertTrue(result.is_complete)
+        self.assertEqual([row.sector_code for row in result.rows], ['BK001'])
+        self.assertEqual(result.invalid_row_count, 2)
+        self.assertEqual(result.upstream_record_count, 3)
+
     def test_retries_a_required_page_then_reports_failed_page_when_retries_are_exhausted(self):
         from kaipanla.services.client import KaipanlaUnavailableError
         from kaipanla.services.fetcher import KaipanlaSectorFundFlowFetcher
@@ -73,7 +110,7 @@ class KaipanlaSectorFundFlowFetcherTests(SimpleTestCase):
             page_size=2,
             max_retries=1,
             retry_delay_seconds=0.1,
-            sleep=sleep,
+            sleep_fn=sleep,
         ).fetch()
 
         self.assertFalse(result.is_complete)
@@ -98,6 +135,67 @@ class KaipanlaSectorFundFlowFetcherTests(SimpleTestCase):
         self.assertFalse(result.is_complete)
         self.assertEqual(result.completed_page_count, 0)
         self.assertEqual(result.rows, ())
+
+    def test_an_injected_client_does_not_change_a_single_pagination_default(self):
+        """注入 client 只换"用哪条传输"，不该换分页策略。
+
+        以前三个参数会随 ``client`` 换源：``max_pages`` 变成写死的 ``100``（而
+        `.env` 配的是 20）、``retry_delay_seconds`` 变成写死的 ``0.0``，而
+        ``page_size`` 干脆没有兜底（``None.page_size`` 直接 AttributeError）。
+        四个值现在都从同一份配置取默认值，所以下面的显式字面量必须一个个对上。
+        """
+        from kaipanla.services.client import KaipanlaSectorFundFlowClientSettings
+        from kaipanla.services.fetcher import KaipanlaSectorFundFlowFetcher
+
+        client_settings = KaipanlaSectorFundFlowClientSettings(
+            endpoint='https://example.invalid',
+            device_id='',
+            user_id='',
+            token='',
+            version='5.23.0.4',
+            api_version='w44',
+            phone_os_new='1',
+            timeout_seconds=1,
+            controller='ZhiShuRanking',
+            action='RealRankingInfo',
+            order='1',
+            ranking_type='1',
+            zs_type='4',
+            page_size=17,
+            request_delay_seconds=0.25,
+        )
+
+        with patch.dict(
+            'os.environ',
+            {'KAIPANLA_MAX_RETRIES': '3', 'KAIPANLA_FLOW_MAX_PAGES': '7'},
+            clear=False,
+        ), patch(
+            'kaipanla.services.fetcher.flow_client_settings',
+            return_value=client_settings,
+        ):
+            fetcher = KaipanlaSectorFundFlowFetcher(client=Mock())
+
+        self.assertEqual(fetcher.page_size, 17)
+        self.assertEqual(fetcher.max_retries, 3)
+        self.assertEqual(fetcher.retry_delay_seconds, 0.25)
+        self.assertEqual(fetcher.max_pages, 7)
+
+    def test_explicit_keywords_still_win_over_the_configured_defaults(self):
+        """显式传参必须压过配置：板块资金流的一次现场修复靠它做到"单页、0 重试"。"""
+        from kaipanla.services.fetcher import KaipanlaSectorFundFlowFetcher
+
+        fetcher = KaipanlaSectorFundFlowFetcher(
+            client=Mock(),
+            page_size=80,
+            max_pages=1,
+            max_retries=0,
+            retry_delay_seconds=0.0,
+        )
+
+        self.assertEqual(fetcher.page_size, 80)
+        self.assertEqual(fetcher.max_pages, 1)
+        self.assertEqual(fetcher.max_retries, 0)
+        self.assertEqual(fetcher.retry_delay_seconds, 0.0)
 
     def test_client_settings_allow_blank_credentials_and_omit_their_fields(self):
         from kaipanla.services.client import (

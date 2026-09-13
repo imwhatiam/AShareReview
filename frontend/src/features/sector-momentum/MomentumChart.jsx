@@ -1,27 +1,23 @@
-import { useEffect, useRef } from 'react'
-import * as echarts from 'echarts'
+import { useMemo } from 'react'
 
+import useChart from '../../shared/charts/useChart'
+import { momentumOption } from '../../shared/charts/chartTheme'
+
+/*
+ * 名次即从左到右的顺序：后端已按评分从高到低排好，这里不再反转，
+ * 评分最高的行业落在最左边的柱组上。
+ */
 export default function MomentumChart({ rankings }) {
-  const containerRef = useRef(null)
+  const option = useMemo(() => momentumOption({ rankings }), [rankings])
+  const containerRef = useChart(option)
 
-  useEffect(() => {
-    const chart = echarts.init(containerRef.current)
-    const resizeChart = () => chart.resize()
-    window.addEventListener('resize', resizeChart)
-    chart.setOption({
-      tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
-      xAxis: { type: 'value', name: '综合评分' },
-      yAxis: { type: 'category', data: rankings.map((item) => item.industry_name).reverse() },
-      series: [{
-        type: 'bar', data: rankings.map((item) => item.score).reverse(),
-        itemStyle: { color: '#c62828' },
-      }],
-    })
-    return () => {
-      window.removeEventListener('resize', resizeChart)
-      chart.dispose()
-    }
-  }, [rankings])
-
-  return <div ref={containerRef} aria-label="行业动量评分图" style={{ height: 320 }} />
+  return (
+    <div
+      ref={containerRef}
+      className="chart"
+      aria-label="行业动量评分图"
+      /* 板块名在类目轴上斜排 45°，比横排柱状图需要更多底部空间。 */
+      style={{ height: 360 }}
+    />
+  )
 }

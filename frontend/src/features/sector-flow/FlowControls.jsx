@@ -1,27 +1,28 @@
+import DatePicker from '../../shared/ui/DatePicker'
+import RefreshStamp from '../../shared/RefreshStamp'
+import SegmentedControl from '../../shared/ui/SegmentedControl'
+
 const WINDOWS = [1, 5, 10, 20]
 
-export default function FlowControls({ date, days, onDateChange, onWindowChange }) {
+/*
+ * 板块资金流筛选条件：与其余三个模块保持一致，直接落在卡片内，
+ * 不额外包一层带边框阴影的面板；可访问名通过 role="group" 保留。
+ * 「更新于 HH:MM」跟在日期控件右侧，与另外三个页面的位置一致。
+ */
+export default function FlowControls({ date, days, onDateChange, onWindowChange, refreshedAt = null }) {
   return (
-    <section aria-label="板块资金流筛选条件">
-      <label htmlFor="flow-date">数据日期</label>
-      <input
-        id="flow-date"
-        type="date"
-        value={date}
-        onChange={(event) => onDateChange(event.target.value)}
+    <div className="toolbar" role="group" aria-label="板块资金流筛选条件">
+      <DatePicker id="flow-date" value={date} onChange={onDateChange} />
+      <RefreshStamp refreshedAt={refreshedAt} />
+      <SegmentedControl
+        legend="统计窗口"
+        options={WINDOWS.map((windowDays) => ({
+          value: windowDays,
+          label: windowDays === 1 ? '当日' : `${windowDays}日`,
+        }))}
+        value={days}
+        onChange={onWindowChange}
       />
-      <div aria-label="统计窗口">
-        {WINDOWS.map((windowDays) => (
-          <button
-            key={windowDays}
-            type="button"
-            aria-pressed={days === windowDays}
-            onClick={() => onWindowChange(windowDays)}
-          >
-            {windowDays === 1 ? '当日' : `${windowDays}日`}
-          </button>
-        ))}
-      </div>
-    </section>
+    </div>
   )
 }

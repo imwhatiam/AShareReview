@@ -7,7 +7,7 @@ from core.services.contracts import (
     CompleteMarketSnapshot,
     MarketDataVersion,
     MarketPrice,
-    ParentIndustry,
+    Industry,
 )
 from stock_moves.models import StockMoveItem
 from stock_moves.services.analysis import build_stock_move_analysis
@@ -49,10 +49,10 @@ class StockMoveAnalysisTests(SimpleTestCase):
                 version='daily-prices-20260908-v1', business_date=self.business_date
             ),
             prices=tuple(prices),
-            parent_industries=tuple(industries),
+            industries=tuple(industries),
         )
 
-    def test_uses_inclusive_thresholds_and_builds_all_four_exchange_groups(self):
+    def test_uses_inclusive_thresholds_and_builds_all_six_exchange_groups(self):
         result = build_stock_move_analysis(self._snapshot([
             self._price('600001', 'sse', '8.000000', '800000000'),
             self._price('600002', 'sse', '-8.000000', '800000000'),
@@ -76,6 +76,8 @@ class StockMoveAnalysisTests(SimpleTestCase):
             StockMoveItem.Group.SSE_FALL: 1,
             StockMoveItem.Group.SZSE_RISE: 1,
             StockMoveItem.Group.SZSE_FALL: 1,
+            StockMoveItem.Group.BSE_RISE: 0,
+            StockMoveItem.Group.BSE_FALL: 0,
         })
         self.assertEqual(result.distinct_stock_count, 4)
 
@@ -101,7 +103,7 @@ class StockMoveAnalysisTests(SimpleTestCase):
             ],
         )
 
-    def test_excludes_bse_and_invalid_prices_but_returns_explicit_warnings(self):
+    def test_keeps_bse_stocks_in_their_own_direction_group_and_skips_invalid_prices(self):
         result = build_stock_move_analysis(self._snapshot([
             self._price('430001', 'bse', '10', '900000000'),
             self._price('600001', 'sse', '10', '900000000', name=''),
@@ -110,11 +112,58 @@ class StockMoveAnalysisTests(SimpleTestCase):
             self._price('000003', 'szse', '10', '900000000', valid=False),
         ]))
 
-        self.assertEqual([(item.group, item.stock_name) for item in result.items], [
-            (StockMoveItem.Group.SSE_RISE, ''),
-        ])
-        self.assertTrue(any('北京证券交易所' in warning for warning in result.warnings))
+        self.assertEqual(
+            [(item.group, item.stock_name) for item in result.items],
+            [
+                (StockMoveItem.Group.SSE_RISE, ''),
+                (StockMoveItem.Group.BSE_RISE, '股票430001'),
+            ],
+        )
+        self.assertEqual(result.group_counts[StockMoveItem.Group.BSE_RISE], 1)
+        self.assertEqual(result.group_counts[StockMoveItem.Group.BSE_FALL], 0)
+        self.assertEqual(result.distinct_stock_count, 2)
+        # 北交所股票不再只以"已排除 N 只"的形式出现在告警里。
+        self.assertFalse(any('北京证券交易所' in warning for warning in result.warnings))
         self.assertTrue(any('名称缺失' in warning for warning in result.warnings))
+
+    def test_bse_groups_split_by_direction_and_sort_each_way(self):
+        result = build_stock_move_analysis(self._snapshot([
+            self._price('830002', 'bse', '-9', '900000000'),
+            self._price('830001', 'bse', '10', '900000000'),
+            self._price('830003', 'bse', '10', '900000000'),
+            self._price('830004', 'bse', '-10', '900000000'),
+        ]))
+
+        # 北交所上涨按涨幅降序、下跌按涨幅升序，与沪深两组口径一致。
+        self.assertEqual(
+            [(item.group, item.rank, item.stock_code) for item in result.items],
+            [
+                (StockMoveItem.Group.BSE_RISE, 1, '830001'),
+                (StockMoveItem.Group.BSE_RISE, 2, '830003'),
+                (StockMoveItem.Group.BSE_FALL, 1, '830004'),
+                (StockMoveItem.Group.BSE_FALL, 2, '830002'),
+            ],
+        )
+
+    def test_bse_stocks_never_join_the_sse_or_szse_groups(self):
+        result = build_stock_move_analysis(self._snapshot([
+            self._price('830001', 'bse', '10', '900000000'),
+            self._price('830002', 'bse', '-10', '900000000'),
+        ]))
+
+        self.assertEqual(
+            {item.group for item in result.items},
+            {StockMoveItem.Group.BSE_RISE, StockMoveItem.Group.BSE_FALL},
+        )
+
+    def test_bse_stocks_below_threshold_are_not_reported_at_all(self):
+        result = build_stock_move_analysis(self._snapshot([
+            self._price('430001', 'bse', '10', '799999999.9999'),
+            self._price('430002', 'bse', '7.999999', '900000000'),
+        ]))
+
+        self.assertEqual(result.items, ())
+        self.assertEqual(result.warnings, ())
 
     def test_keeps_all_matching_parent_industry_labels_and_reports_unmapped_stocks(self):
         result = build_stock_move_analysis(self._snapshot(
@@ -123,13 +172,13 @@ class StockMoveAnalysisTests(SimpleTestCase):
                 self._price('600002', 'sse', '10', '900000000'),
             ],
             [
-                ParentIndustry('I002', '半导体', ('600001',)),
-                ParentIndustry('I001', '电子', ('600001',)),
+                Industry('I002', '半导体', ('600001',)),
+                Industry('I001', '电子', ('600001',)),
             ],
         ))
 
         item = result.items[0]
-        self.assertEqual(item.parent_industries, (
+        self.assertEqual(item.industries, (
             {'code': 'I001', 'name': '电子'},
             {'code': 'I002', 'name': '半导体'},
         ))

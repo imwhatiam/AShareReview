@@ -6,7 +6,7 @@ from django.utils import timezone
 
 from core.models import TradingDay
 from kaipanla.services.intraday import validate_ranking_limits
-from kaipanla.services.queries import load_close_snapshot_rows
+from kaipanla.services.queries import load_close_snapshot_rows, published_version_strings
 
 SUPPORTED_HISTORY_WINDOWS = frozenset({1, 5, 10, 20})
 CLOSE_TIME = time(15, 0)
@@ -65,7 +65,9 @@ def query_intraday_history(end_date, *, days=5, inflow_top=5, outflow_top=5):
 
     trade_dates = trading_day_window(end_date, count=days)
     close_times = [_close_time(trade_date) for trade_date in trade_dates]
-    snapshot_rows = load_close_snapshot_rows(trade_dates, close_times)
+    snapshot_rows = load_close_snapshot_rows(
+        trade_dates, close_times, published_version_strings(trade_dates)
+    )
     rankings = _period_rankings(snapshot_rows, inflow_top, outflow_top)
     selected_codes = [
         item['code']

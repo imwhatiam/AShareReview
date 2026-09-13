@@ -1,8 +1,9 @@
 """Bounded REST client for Hithink public A-share market data."""
 
+import logging
 from dataclasses import dataclass
 from datetime import date, datetime, time
-from time import sleep
+from time import perf_counter, sleep
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -10,6 +11,7 @@ import requests
 from django.core.exceptions import ImproperlyConfigured
 
 from backend.env import get_required_setting
+from core.api.errors import upstream_error_code_value
 from core.integrations.hithink.contracts import (
     HithinkAuthenticationError,
     HithinkPayloadError,
@@ -17,13 +19,21 @@ from core.integrations.hithink.contracts import (
     HithinkUnavailableError,
 )
 from core.integrations.hithink.mappers import (
+    map_industry_constituent,
+    map_industry_index,
     map_price_bar,
+    map_quote_snapshot,
     map_ticker,
     map_trading_day,
 )
+from core.logging import elapsed_ms, log_event
 
+
+logger = logging.getLogger(__name__)
 
 _SHANGHAI = ZoneInfo('Asia/Shanghai')
+# 同花顺指数清单按标签分族：industry 是 881xxx 行业，cn_concept 是概念。
+_INDUSTRY_INDEX_TAG = 'industry'
 
 
 @dataclass(frozen=True)
@@ -114,7 +124,61 @@ class HithinkClient:
         )
         return tuple(map_price_bar(item) for item in self._items(data))
 
+    def list_industry_indices(self):
+        """Return every Tonghuashun industry index (881xxx.TI / 884xxx.TI).
+
+        The upstream endpoint has no pagination: one call returns the whole tag.
+        """
+        data = self._get(
+            '/api/a-share-index/catalog/ths-index-list',
+            {'tag': _INDUSTRY_INDEX_TAG},
+        )
+        return tuple(map_industry_index(item) for item in self._items(data))
+
+    def list_industry_constituents(self, thscode: str):
+        """Return the constituent stock codes of one Tonghuashun industry index.
+
+        The upstream rejects comma-separated lists (``code=1002``), so callers
+        must request one index at a time. The list is the current membership —
+        the endpoint accepts no date and always answers for the latest state.
+        """
+        if not thscode or ',' in thscode:
+            raise ValueError('Industry constituent request is invalid.')
+        data = self._get(
+            '/api/a-share-index/constituents/ths-stock-list',
+            {'thscode': thscode},
+        )
+        return tuple(map_industry_constituent(item) for item in self._items(data))
+
+    def list_market_quotes(self, *, limit: int, offset: int):
+        """Return one page of the whole-market intraday quote snapshot.
+
+        ``thscodes`` is deliberately omitted: that makes the upstream walk the
+        complete A-share code table (ascending ``thscode``) and page it by
+        ``limit`` / ``offset``. One page of a thousand covers a fifth of the
+        market, versus one request per stock for the historical endpoint — the
+        difference between a two-second refresh and a six-minute one.
+
+        The upstream ``total`` is returned as a paging hint only; callers must
+        still stop on a short or empty page, because a stale ``total`` would
+        otherwise spin the loop forever.
+        """
+        if not 1 <= limit <= 10000 or offset < 0:
+            raise ValueError('Quote snapshot pagination is outside the upstream range.')
+        data = self._get(
+            '/api/a-share/prices/snapshot',
+            {'limit': limit, 'offset': offset},
+        )
+        total = data.get('total')
+        if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+            total = None
+        return tuple(map_quote_snapshot(item) for item in self._items(data)), total
+
     def _get(self, path: str, params: dict[str, Any]) -> dict:
+        # 上游调用是整个系统最容易失败的地方，也是唯一"重试"发生的地方：每次重试
+        # 记一行 WARNING（含原因），最终放弃记 ERROR。成功的调用只记 DEBUG ——
+        # 一次同步会打几千次，INFO 会把日志淹掉，而耗时在命令级的进度日志里已有。
+        started_at = perf_counter()
         for attempt in range(self._settings.max_retries + 1):
             try:
                 try:
@@ -128,11 +192,40 @@ class HithinkClient:
                     raise HithinkUnavailableError(
                         'Hithink REST is temporarily unavailable.'
                     ) from error
-                return self._parse_response(response)
-            except (HithinkRateLimitError, HithinkUnavailableError):
+                data = self._parse_response(response)
+            except (HithinkRateLimitError, HithinkUnavailableError) as error:
                 if attempt == self._settings.max_retries:
+                    log_event(
+                        logger,
+                        'upstream_failed',
+                        level=logging.ERROR,
+                        provider='hithink',
+                        path=path,
+                        attempts=attempt + 1,
+                        duration_ms=elapsed_ms(started_at),
+                        error=error,
+                        error_code=upstream_error_code_value(error),
+                    )
                     raise
+                log_event(
+                    logger,
+                    'upstream_retry',
+                    level=logging.WARNING,
+                    provider='hithink',
+                    path=path,
+                    attempt=attempt + 1,
+                    retry_delay_seconds=self._settings.request_delay_seconds,
+                    reason=error,
+                )
                 sleep(self._settings.request_delay_seconds)
+                continue
+            logger.debug(
+                '%s provider=hithink path=%s duration_ms=%s',
+                'upstream_ok',
+                path,
+                elapsed_ms(started_at),
+            )
+            return data
 
         raise AssertionError('Bounded request loop unexpectedly ended.')
 

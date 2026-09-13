@@ -95,8 +95,7 @@ class TradingDayAdmin(ReadOnlyAdmin):
 
 @admin.register(IndustrySnapshot)
 class IndustrySnapshotAdmin(ReadOnlyAdmin):
-    list_display = ('industry_code', 'industry_name', 'industry_level')
-    list_filter = ('industry_level',)
+    list_display = ('industry_code', 'industry_name')
     search_fields = ('industry_code', 'industry_name')
 
 

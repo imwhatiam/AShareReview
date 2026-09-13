@@ -43,7 +43,7 @@ class HundredDayStockFlag(models.Model):
     )
     stock_code = models.CharField(max_length=6, verbose_name='股票代码')
     stock_name = models.CharField(max_length=64, verbose_name='股票名称')
-    parent_industries = models.JSONField(default=list, verbose_name='父行业快照')
+    industries = models.JSONField(default=list, verbose_name='所属行业快照')
     is_new_high = models.BooleanField(default=False, verbose_name='是否新高')
     is_new_low = models.BooleanField(default=False, verbose_name='是否新低')
 
@@ -92,7 +92,7 @@ class HundredDayIndustrySummary(models.Model):
             ),
         ]
         ordering = ['industry_code']
-        verbose_name = '百日新高新低父行业汇总'
+        verbose_name = '百日新高新低板块汇总'
         verbose_name_plural = verbose_name
 
     def __str__(self):

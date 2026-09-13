@@ -1,5 +1,6 @@
 """Pure legacy-compatible hundred-day high/low flag calculation."""
 
+from collections import deque
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
@@ -38,15 +39,34 @@ def _validate_trading_days(trading_days: tuple[date, ...]) -> None:
         raise ValueError('Trading days must not contain duplicates.')
 
 
-def _history_extrema(
-    stock_closes: Mapping[date, Decimal | None], history_days: tuple[date, ...]
-) -> tuple[Decimal, Decimal]:
-    """Return max/min after applying the legacy fill-missing-history-with-zero rule."""
-    history = tuple(
-        _ZERO if stock_closes.get(day) is None else stock_closes[day]
-        for day in history_days
-    )
-    return max(history), min(history)
+def _sliding_extrema(filled: list[Decimal], available_positions: int, window: int):
+    """Yield ``(position, maximum, minimum)`` for each window of the preceding ``window`` days.
+
+    ``filled`` is the stock's close series aligned to the trading days, with every
+    missing value already replaced by zero. Both extrema come from the same
+    ``window``-sized window ending at ``position - 1``, so two monotonic deques keep
+    this linear in the number of positions instead of quadratic in the window length.
+    Positions with fewer than ``window`` preceding days are skipped.
+    """
+    maximums: deque[int] = deque()
+    minimums: deque[int] = deque()
+    for index in range(available_positions - 1):
+        value = filled[index]
+        while maximums and filled[maximums[-1]] <= value:
+            maximums.pop()
+        maximums.append(index)
+        while minimums and filled[minimums[-1]] >= value:
+            minimums.pop()
+        minimums.append(index)
+        position = index + 1
+        if position < window:
+            continue
+        lower_bound = position - window
+        while maximums[0] < lower_bound:
+            maximums.popleft()
+        while minimums[0] < lower_bound:
+            minimums.popleft()
+        yield position, filled[maximums[0]], filled[minimums[0]]
 
 
 def compute_high_low_flags(
@@ -70,35 +90,43 @@ def compute_high_low_flags(
             valid_stock_counts_by_date={},
         )
 
-    flags_by_date: dict[date, tuple[HighLowFlag, ...]] = {}
-    valid_stock_counts_by_date: dict[date, int] = {}
-    for position in range(ROLLING_HISTORY_POSITIONS, available_positions):
-        target_day = trading_days[position]
-        history_days = trading_days[position - ROLLING_HISTORY_POSITIONS:position]
-        flags: list[HighLowFlag] = []
-        valid_stock_count = 0
-        for stock_code in sorted(close_prices_by_stock):
-            stock_closes = close_prices_by_stock[stock_code]
-            target_close = stock_closes.get(target_day)
+    positions = range(ROLLING_HISTORY_POSITIONS, available_positions)
+    flags_by_position: dict[int, list[HighLowFlag]] = {position: [] for position in positions}
+    valid_stock_counts_by_position = dict.fromkeys(positions, 0)
+
+    for stock_code in sorted(close_prices_by_stock):
+        stock_closes = close_prices_by_stock[stock_code]
+        # 历史窗口内缺失收盘价按既有规则补 0；目标日缺失仍然是"无有效成交"，不参与旗标。
+        filled = [
+            _ZERO if stock_closes.get(day) is None else stock_closes[day]
+            for day in trading_days
+        ]
+        for position, historical_maximum, historical_minimum in _sliding_extrema(
+            filled, available_positions, ROLLING_HISTORY_POSITIONS
+        ):
+            target_close = stock_closes.get(trading_days[position])
             if target_close is None:
                 continue
-            valid_stock_count += 1
-            historical_maximum, historical_minimum = _history_extrema(
-                stock_closes, history_days
-            )
+            valid_stock_counts_by_position[position] += 1
             is_new_high = target_close >= historical_maximum
             is_new_low = target_close <= historical_minimum
             if is_new_high or is_new_low:
-                flags.append(
+                flags_by_position[position].append(
                     HighLowFlag(
                         stock_code=stock_code,
                         is_new_high=is_new_high,
                         is_new_low=is_new_low,
                     )
                 )
-        flags_by_date[target_day] = tuple(flags)
-        valid_stock_counts_by_date[target_day] = valid_stock_count
 
+    flags_by_date = {
+        trading_days[position]: tuple(flags_by_position[position])
+        for position in positions
+    }
+    valid_stock_counts_by_date = {
+        trading_days[position]: valid_stock_counts_by_position[position]
+        for position in positions
+    }
     return HighLowFlagResult(
         has_sufficient_history=True,
         required_trading_day_positions=_REQUIRED_TRADING_DAY_POSITIONS,

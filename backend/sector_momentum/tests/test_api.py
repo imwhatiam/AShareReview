@@ -72,7 +72,7 @@ class SectorMomentumApiTests(TestCase):
             first.json()['data']['rankings']['above_5pct'][0]['stocks'][0]['code'], '600001'
         )
         self.assertEqual(first.json()['data']['rankings']['top_5_percent'], [])
-        self.assertIn('1 只有效股票未映射到开盘啦父行业。', first.json()['warnings'])
+        self.assertIn('1 只有效股票未映射到开盘啦板块。', first.json()['warnings'])
         self.assertEqual(second.status_code, 200)
         self.assertEqual(second.json()['source'], 'cache')
         self.assertEqual(second.json()['data'], first.json()['data'])

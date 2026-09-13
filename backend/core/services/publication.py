@@ -1,6 +1,6 @@
 """Transactional lifecycle for publishing versioned public datasets."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from typing import Callable
 from uuid import uuid4
@@ -44,6 +44,71 @@ def begin_publication(
         business_date=business_date,
         expected_record_count=expected_record_count,
         version=version,
+    )
+
+
+def set_publication_details(
+    run: PublicationRun, record_count: int, business_date: date | None
+) -> PublicationRun:
+    """Fill in the record count and business date a fetch only reveals afterwards.
+
+    ``begin_publication`` must run *before* the upstream fetch — that way a crash
+    mid-fetch still leaves a RUNNING version (and a running status row) behind
+    instead of nothing. But neither number is known at that point, so two callers
+    (stock master / trading calendar, and the industry snapshot) used to carry
+    byte-identical private copies of this rewrite. It lives here now:
+    ``finish_publication`` compares ``actual_record_count`` against
+    ``expected_record_count``, so a stale count silently turns every run into
+    PARTIAL.
+
+    The returned run must be the one passed to ``publish_with_writer`` /
+    ``finish_publication`` — those read the counts off the dataclass, not the row.
+    """
+    DataVersion.objects.filter(version=run.version).update(
+        expected_record_count=record_count,
+        business_date=business_date,
+    )
+    return replace(
+        run,
+        expected_record_count=record_count,
+        business_date=business_date,
+    )
+
+
+def supersede_previous_versions(
+    dataset_key: str, business_date: date, *, keep_version: str
+) -> int:
+    """Stop the versions a rerun replaced from claiming rows they no longer hold.
+
+    Re-running a publication for a business day that already had a COMPLETE
+    version creates a second one and re-stamps every row of that day to the new
+    version — the read path filters rows by ``source_data_version``, so those rows
+    genuinely belong to the new version now. The old ``DataVersion`` row keeps
+    ``status=complete``: that a run completed is history and must not be
+    rewritten. Its ``expected``/``actual`` counts, however, are not history —
+    they are the version's *current* footprint — and leaving them alone made the
+    admin list show two "complete" versions with full counts for the same day, so
+    an operator could not tell which one the store was serving.
+
+    Resetting the three counts to zero restores the invariant an operator reads
+    the list with: exactly one COMPLETE row per business day has a non-zero count,
+    and it is the live one. Returns the number of versions retired.
+
+    Only COMPLETE and PARTIAL rows are touched — RUNNING/FAILED versions never
+    claimed a published footprint.
+    """
+    return (
+        DataVersion.objects.filter(
+            dataset_key=dataset_key,
+            business_date=business_date,
+            status__in=(DataVersion.Status.COMPLETE, DataVersion.Status.PARTIAL),
+        )
+        .exclude(version=keep_version)
+        .update(
+            expected_record_count=0,
+            actual_record_count=0,
+            missing_record_count=0,
+        )
     )
 
 

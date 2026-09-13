@@ -2,7 +2,7 @@ from core.management.base import BaseDataCommand
 
 
 class Command(BaseDataCommand):
-    help = 'Initialize one year of public A-share daily prices exactly once.'
+    help = 'Import one year of public A-share daily prices, revising existing rows.'
     dataset_key = 'stock_daily_prices'
     failure_message = 'Initial daily-price import failed.'
 
@@ -20,11 +20,34 @@ class Command(BaseDataCommand):
 
     def format_success_message(self, result, options):
         if result.dry_run:
+            if result.is_up_to_date:
+                return (
+                    f'dry-run: {result.record_count} daily-price records for '
+                    f'{result.trading_day_count} trading days already match upstream; '
+                    f'nothing to update.'
+                )
+            if result.is_initial_import:
+                return (
+                    f'dry-run: would initialize {result.trading_day_count} trading days '
+                    f'and {result.record_count} daily-price records.'
+                )
             return (
-                f'dry-run: would initialize {result.trading_day_count} trading days '
-                f'and {result.record_count} daily-price records.'
+                f'dry-run: would update {result.changed_record_count} of '
+                f'{result.record_count} daily-price records across '
+                f'{result.updated_trading_day_count} trading days.'
+            )
+        if result.is_initial_import:
+            return (
+                f'initialized {result.trading_day_count} trading days and '
+                f'{result.record_count} daily-price records.'
+            )
+        if result.is_up_to_date:
+            return (
+                f'no changes: {result.record_count} daily-price records for '
+                f'{result.trading_day_count} trading days already match upstream.'
             )
         return (
-            f'initialized {result.trading_day_count} trading days and '
-            f'{result.record_count} daily-price records.'
+            f'updated {result.changed_record_count} of {result.record_count} daily-price '
+            f'records across {result.updated_trading_day_count} trading days '
+            f'({result.unchanged_record_count} unchanged).'
         )

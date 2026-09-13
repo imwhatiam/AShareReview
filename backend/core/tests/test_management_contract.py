@@ -1,57 +1,90 @@
 from io import StringIO
 from unittest.mock import patch
 
-from django.core.management import call_command
+from django.core.management import call_command, get_commands, load_command_class
 from django.core.management.base import CommandError
 from django.test import SimpleTestCase, TestCase
 
+from core.management.base import BaseDataCommand
 from core.services.locking import DatasetLocked
 from core.services.sync_reference import ReferenceSyncResult
 
 
+# 这份清单只是"有没有漏登记"的哨兵：锁定行为本身是遍历发现出来的，不靠它。
+_DATA_COMMAND_NAMES = {
+    'build_hundred_day',
+    'build_sector_momentum',
+    'build_stock_moves',
+    'fetch_kaipanla_sector_fund_flow',
+    'init_stock_daily_prices',
+    'refresh_intraday_quotes',
+    'sync_kaipanla_industry_snapshot',
+    'sync_stock_daily_prices',
+    'sync_stock_master',
+    'sync_trading_calendar',
+}
+
+# 四个 --date 命令的必填值；其余参数都带默认值。填的是日期，命令的 type 也是
+# date.fromisoformat，所以能通过解析。
+_DATA_COMMAND_DATE = '2026-09-08'
+
+
+def _discover_data_commands() -> set[str]:
+    """从 Django 的命令注册表里发现所有 ``BaseDataCommand`` 子类。
+
+    这里**必须**是发现而不是手写：原来的手写清单漏掉了新增的
+    ``refresh_intraday_quotes``，于是"每个数据命令都要先抢数据集锁"这条不变量
+    在它身上无人看守。发现式写法让"加了命令忘了登记"不可能再悄悄发生。
+    """
+    return {
+        name
+        for name, app_label in get_commands().items()
+        if isinstance(load_command_class(app_label, name), BaseDataCommand)
+    }
+
+
+def _required_arguments(command_name: str) -> tuple[str, ...]:
+    """补上命令的必填参数，让调用能走到"抢锁"那一步。
+
+    参数从命令自己的 parser 里问出来，同样不手写：手写清单正是上一条不变量漏掉
+    ``refresh_intraday_quotes`` 的同一种病。这里用了 argparse 的私有 ``_actions``
+    —— 它没有公开的枚举接口，而漏一个必填参数的表现是"用例假成功"，不值得为
+    避免私有属性冒这个险。
+    """
+    command = load_command_class(get_commands()[command_name], command_name)
+    parser = command.create_parser('manage.py', command_name)
+    arguments: list[str] = []
+    for action in parser._actions:  # noqa: SLF001
+        if action.required:
+            arguments.extend(action.option_strings[:1])
+            arguments.append(_DATA_COMMAND_DATE)
+    return tuple(arguments)
+
+
 class ManagementCommandContractTests(SimpleTestCase):
     def test_public_commands_reject_an_active_dataset_lock_before_calling_services(self):
-        commands = (
-            (
-                'sync_stock_master',
-                ('--limit', '1'),
-                'core.services.sync_reference.sync_stock_master',
-            ),
-            (
-                'sync_trading_calendar',
-                (),
-                'core.services.sync_reference.sync_trading_calendar',
-            ),
-            (
-                'sync_kaipanla_industry_snapshot',
-                (),
-                'core.services.sync_industries.sync_kaipanla_industry_snapshot',
-            ),
-            (
-                'init_stock_daily_prices',
-                ('--years', '1'),
-                'core.services.sync_daily_prices.initialize_stock_daily_prices',
-            ),
-            (
-                'sync_stock_daily_prices',
-                ('--date', '2026-09-08'),
-                'core.services.sync_daily_prices.sync_stock_daily_prices',
-            ),
+        self.assertEqual(
+            _discover_data_commands(),
+            _DATA_COMMAND_NAMES,
+            '数据命令清单变了：把新命令的 dataset_key 与锁语义核对后再更新这份哨兵。',
         )
 
-        for command_name, arguments, service_path in commands:
+        for command_name in sorted(_DATA_COMMAND_NAMES):
             with self.subTest(command=command_name):
                 with (
                     patch(
                         'core.management.base.dataset_lock',
                         side_effect=DatasetLocked('core:test is already running.'),
                     ),
-                    patch(service_path) as service,
-                    self.assertRaises(CommandError),
+                    # 直接掐掉基类的方法：真跑起来会打上游，而且每个子类的服务入口
+                    # 各不相同，逐个 patch 服务路径正是上一版会漏的原因。
+                    patch.object(BaseDataCommand, 'run_data_sync') as run_data_sync,
+                    self.assertRaises(CommandError) as caught,
                 ):
-                    call_command(command_name, *arguments)
+                    call_command(command_name, *_required_arguments(command_name))
 
-                service.assert_not_called()
+                run_data_sync.assert_not_called()
+                self.assertIn('already running', str(caught.exception))
 
     def test_failure_logs_redact_sensitive_values_and_include_command_context(self):
         with (

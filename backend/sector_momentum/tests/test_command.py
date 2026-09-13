@@ -12,7 +12,7 @@ from core.services.contracts import (
     CompleteMarketSnapshot,
     MarketDataVersion,
     MarketPrice,
-    ParentIndustry,
+    Industry,
 )
 from core.services.market_data import CompleteMarketDataUnavailable
 from sector_momentum.models import (
@@ -38,7 +38,7 @@ class BuildSectorMomentumCommandTests(TestCase):
                     turnover=Decimal('800000000'), has_valid_trade=True,
                 ),
             ),
-            parent_industries=(ParentIndustry('I001', '银行', ('600001',)),),
+            industries=(Industry('I001', '银行', ('600001',)),),
         )
 
     def _industry_version(self, version='industry-v1'):

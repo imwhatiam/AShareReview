@@ -4,7 +4,7 @@ from decimal import Decimal
 from django.test import TestCase
 from django.utils import timezone
 
-from core.models import TradingDay
+from core.models import DataVersion, TradingDay
 from kaipanla.models import KaipanlaSectorFundFlowSnapshot
 
 
@@ -21,6 +21,24 @@ class KaipanlaQueryServiceTests(TestCase):
             ]
         )
 
+    def _version_for(self, trade_date):
+        """发布某个交易日快照的版本号（生产里每个 5 分钟槽各一次发布）。
+
+        行上必须盖着它：读路径只服务"已发布版本"的行，否则这些夹具行会被过滤掉。
+        """
+        version = f'kaipanla-queries-{trade_date.isoformat()}'
+        DataVersion.objects.get_or_create(
+            version=version,
+            defaults={
+                'dataset_key': 'kaipanla_sector_fund_flow',
+                'business_date': trade_date,
+                'status': DataVersion.Status.COMPLETE,
+                'expected_record_count': 1,
+                'actual_record_count': 1,
+            },
+        )
+        return version
+
     def _snapshot(self, trade_date, hour, minute, code, name, net_inflow):
         snapshot_time = timezone.make_aware(datetime(
             trade_date.year, trade_date.month, trade_date.day, hour, minute
@@ -31,6 +49,7 @@ class KaipanlaQueryServiceTests(TestCase):
             trade_date=trade_date,
             snapshot_time=snapshot_time,
             main_net_inflow=Decimal(str(net_inflow)),
+            source_data_version=self._version_for(trade_date),
             source_batch_id=f'{trade_date}-{hour:02d}{minute:02d}',
         )
 

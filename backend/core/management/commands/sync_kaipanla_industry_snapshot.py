@@ -2,7 +2,7 @@ from core.management.base import BaseDataCommand
 
 
 class Command(BaseDataCommand):
-    help = 'Synchronize the Kaipanla parent and child industry stock snapshot.'
+    help = 'Synchronize the Kaipanla industry stock snapshot.'
     dataset_key = 'kaipanla_industry_snapshot'
     failure_message = 'Kaipanla industry snapshot synchronization failed.'
 
@@ -16,4 +16,7 @@ class Command(BaseDataCommand):
 
     def format_success_message(self, result, options):
         mode = 'dry-run: would synchronize' if result.dry_run else 'synchronized'
-        return f'{mode} {result.record_count} industry records.'
+        return (
+            f'{mode} {result.record_count} industry records for {result.business_date}.'
+            f' Backfilled {result.backfilled_stock_count} stock assignments from Hithink.'
+        )

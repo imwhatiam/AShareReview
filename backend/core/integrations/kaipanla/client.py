@@ -1,23 +1,52 @@
 """Bounded Kaipanla client for the public industry-to-stock snapshot."""
 
+import logging
 from dataclasses import dataclass
 import re
-from time import sleep
+from time import perf_counter, sleep
 from typing import Any
 
 import requests
 from django.core.exceptions import ImproperlyConfigured
-from django.utils import timezone
 
 from backend.env import get_required_setting, get_setting
+from core.api.errors import upstream_error_code_value
+from core.logging import elapsed_ms, log_event, redact_sensitive_text
+from core.services.calendar import latest_trading_date
+
+
+logger = logging.getLogger(__name__)
 
 
 class KaipanlaUnavailableError(RuntimeError):
     """The Kaipanla endpoint rejected or could not complete a request."""
 
 
+class KaipanlaRateLimitError(KaipanlaUnavailableError):
+    """The Kaipanla endpoint refused the request because we are being throttled.
+
+    A subclass on purpose: every existing ``except KaipanlaUnavailableError``
+    keeps working, while the error-code mapping can single out 429 as
+    ``UPSTREAM_RATE_LIMITED``.
+    """
+
+
 class KaipanlaPayloadError(RuntimeError):
     """The Kaipanla endpoint returned an unusable response shape."""
+
+
+def _upstream_error_detail(error_code: str, error_message) -> str:
+    """Render an upstream business error so an operator can act on it.
+
+    The raw envelope carries the reason (e.g. ``errcode 1020 参数出错`` for a
+    ``Date`` the history endpoint will not serve); swallowing it leaves only
+    "request was rejected", which is unactionable.
+    """
+    fields = [f'errcode={error_code or "unknown"}']
+    message = ' '.join(redact_sensitive_text(error_message or '').split())
+    if message:
+        fields.append(f'errmsg={message[:120]}')
+    return ' (' + ', '.join(fields) + ')'
 
 
 @dataclass(frozen=True)
@@ -38,7 +67,6 @@ class _ClientSettings:
     parent_order: str
     parent_type: str
     parent_zs_type: str
-    child_show: str
     stock_order: str
     stock_tszb: str
     stock_old: str
@@ -93,7 +121,6 @@ def _settings() -> _ClientSettings:
         parent_order=get_required_setting('KAIPANLA_INDUSTRY_PARENT_ORDER'),
         parent_type=get_required_setting('KAIPANLA_INDUSTRY_PARENT_TYPE'),
         parent_zs_type=get_required_setting('KAIPANLA_INDUSTRY_PARENT_ZS_TYPE'),
-        child_show=get_required_setting('KAIPANLA_INDUSTRY_CHILD_SHOW'),
         stock_order=get_required_setting('KAIPANLA_INDUSTRY_STOCK_ORDER'),
         stock_tszb=get_required_setting('KAIPANLA_INDUSTRY_STOCK_TSZB'),
         stock_old=get_required_setting('KAIPANLA_INDUSTRY_STOCK_OLD'),
@@ -107,8 +134,15 @@ class KaipanlaIndustryClient:
     def __init__(self, transport=None):
         self._settings = _settings()
         self._transport = transport or requests.Session()
+        # Resolved once per client so a paginated run does not re-query the calendar.
+        self._request_date_value = None
 
-    def list_parent_industries(self):
+    @property
+    def request_date(self) -> str:
+        """The ``Date`` this client sends, exposed for publication metadata."""
+        return self._request_date()
+
+    def list_industries(self):
         return self._list_industries(
             action=get_required_setting('KAIPANLA_PARENT_INDUSTRY_ACTION'),
             response_key='list',
@@ -120,21 +154,6 @@ class KaipanlaIndustryClient:
             },
             include_credentials=True,
         )
-
-    def list_child_industries(self, parent_code):
-        if not parent_code:
-            raise ValueError('Parent industry code is required.')
-        payload = self._post(
-            {
-                **self._common_params(include_credentials=True),
-                'a': get_required_setting('KAIPANLA_CHILD_INDUSTRY_ACTION'),
-                'c': self._settings.controller,
-                'IsShow': self._settings.child_show,
-                'Date': self._request_date(),
-                'PlateID': parent_code,
-            }
-        )
-        return self._map_industries(self._rows(payload, 'List'))
 
     def list_stock_codes(self, industry_code):
         if not industry_code:
@@ -251,9 +270,22 @@ class KaipanlaIndustryClient:
         return rows
 
     def _request_date(self):
-        return get_setting('KAIPANLA_INDUSTRY_DATE', '') or timezone.localdate().isoformat()
+        """Return the ``Date`` upstream accepts, which is never a non-trading day.
+
+        The history endpoint serves a session's industry-to-stock mapping, and it
+        answers ``errcode 1020`` (参数出错) for weekends, holidays and any date
+        without a session. Defaulting to today therefore broke every off-session
+        run, so the default resolves to the newest served trading day instead.
+        ``KAIPANLA_INDUSTRY_DATE`` still overrides it for deliberate backfills.
+        """
+        if self._request_date_value is None:
+            configured = (get_setting('KAIPANLA_INDUSTRY_DATE', '') or '').strip()
+            self._request_date_value = configured or latest_trading_date().isoformat()
+        return self._request_date_value
 
     def _post(self, data: dict[str, Any]):
+        # 与同花顺客户端同样的口径：重试记 WARNING、放弃记 ERROR、成功只记 DEBUG。
+        started_at = perf_counter()
         for attempt in range(self._settings.max_retries + 1):
             if self._settings.request_delay_seconds:
                 sleep(self._settings.request_delay_seconds)
@@ -277,14 +309,42 @@ class KaipanlaIndustryClient:
                     raise KaipanlaUnavailableError(
                         'Kaipanla is temporarily unavailable.'
                     ) from error
-                return self._parse_response(response)
-            except KaipanlaUnavailableError:
+                payload = self._parse_response(response)
+            except KaipanlaUnavailableError as error:
                 if attempt == self._settings.max_retries:
+                    log_event(
+                        logger,
+                        'upstream_failed',
+                        level=logging.ERROR,
+                        provider='kaipanla',
+                        attempts=attempt + 1,
+                        duration_ms=elapsed_ms(started_at),
+                        error=error,
+                        error_code=upstream_error_code_value(error),
+                    )
                     raise
+                log_event(
+                    logger,
+                    'upstream_retry',
+                    level=logging.WARNING,
+                    provider='kaipanla',
+                    attempt=attempt + 1,
+                    retry_delay_seconds=self._settings.request_delay_seconds,
+                    reason=error,
+                )
+                continue
+            logger.debug(
+                '%s provider=kaipanla duration_ms=%s',
+                'upstream_ok',
+                elapsed_ms(started_at),
+            )
+            return payload
         raise AssertionError('Bounded Kaipanla request loop unexpectedly ended.')
 
     @staticmethod
     def _parse_response(response):
+        if response.status_code == 429:
+            raise KaipanlaRateLimitError('Kaipanla request was throttled.')
         if not 200 <= response.status_code < 300:
             raise KaipanlaUnavailableError('Kaipanla request failed.')
         try:
@@ -293,6 +353,11 @@ class KaipanlaIndustryClient:
             raise KaipanlaPayloadError('Kaipanla returned invalid JSON.') from error
         if not isinstance(payload, dict):
             raise KaipanlaPayloadError('Kaipanla response envelope is invalid.')
-        if str(payload.get('errcode')) != '0':
-            raise KaipanlaUnavailableError('Kaipanla request was rejected.')
+        error_code = str(payload.get('errcode', '')).strip()
+        if error_code != '0':
+            raise KaipanlaUnavailableError(
+                'Kaipanla request was rejected'
+                + _upstream_error_detail(error_code, payload.get('errmsg'))
+                + '.'
+            )
         return payload

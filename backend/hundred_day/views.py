@@ -1,79 +1,29 @@
 """Authenticated JSON endpoints for the hundred-day analysis module."""
 
-from django.views.decorators.http import require_GET
-
-from core.api.errors import ApiError, ErrorCode
-from core.api.responses import api_success
-from core.api.validators import parse_iso_date
+from core.api.errors import ErrorCode
+from core.api.read_endpoints import UnavailableRule, build_read_endpoints
 from core.services.market_data import CompleteMarketDataUnavailable
 from hundred_day.services.analysis import InsufficientHundredDayHistory
 from hundred_day.services.read_path import read_dates, read_hundred_day
 
-
-def _require_authenticated(request):
-    if not request.user.is_authenticated:
-        raise ApiError(ErrorCode.AUTH_REQUIRED, '请先登录。', http_status=401)
-
-
-def _optional_date(request):
-    value = request.GET.get('date')
-    return None if value is None else parse_iso_date(value)
-
-
-def _success(result):
-    return api_success(
-        data=result.data,
-        business_date=result.business_date,
-        data_version=result.data_version,
-        source=result.source,
-        stale=result.stale,
-        warnings=list(result.warnings),
-    )
-
-
-def _handle(handler, *, requested_date: bool = False):
-    try:
-        return handler()
-    except InsufficientHundredDayHistory as error:
-        return ApiError(
-            ErrorCode.INSUFFICIENT_HISTORY,
-            str(error),
-            http_status=202,
+results, dates = build_read_endpoints(
+    read_result=lambda trade_date=None: read_hundred_day(trade_date),
+    read_dates=lambda: read_dates(),
+    rules=(
+        # 历史不足缺的是"更早的 199 个交易日"，对任何一个已经过去的日期都**不会**
+        # 自愈：202 只会让前端进"稍后重试"分支并误导运维。显式指定日期时按规格
+        # §5.8 第 6 条返回 404。默认入口（未指定日期）仍可能是"首屏还没准备好"，
+        # 保留 202 + INSUFFICIENT_HISTORY，前端据此显示具体原因。
+        UnavailableRule(
+            InsufficientHundredDayHistory,
+            absent_code=ErrorCode.INSUFFICIENT_HISTORY,
+            preparing_code=ErrorCode.INSUFFICIENT_HISTORY,
             preparation_state='insufficient_history',
-        ).as_response()
-    except CompleteMarketDataUnavailable:
-        if requested_date:
-            return ApiError(
-                ErrorCode.DATA_NOT_AVAILABLE,
-                '请求日期没有可用的百日新高新低数据。',
-                http_status=404,
-            ).as_response()
-        return ApiError(
-            ErrorCode.DATA_PREPARING,
-            '百日新高新低数据正在准备中，请先运行管理命令。',
-            http_status=202,
-            preparation_state='preparing',
-        ).as_response()
-    except ApiError as error:
-        return error.as_response()
-
-
-@require_GET
-def results(request):
-    requested_date = 'date' in request.GET
-    return _handle(lambda: _results(request), requested_date=requested_date)
-
-
-def _results(request):
-    _require_authenticated(request)
-    return _success(read_hundred_day(_optional_date(request)))
-
-
-@require_GET
-def dates(request):
-    return _handle(lambda: _dates(request))
-
-
-def _dates(request):
-    _require_authenticated(request)
-    return _success(read_dates())
+        ),
+        UnavailableRule(
+            CompleteMarketDataUnavailable,
+            absent_message='请求日期没有可用的百日新高新低数据。',
+            preparing_message='百日新高新低数据正在准备中，请先运行管理命令。',
+        ),
+    ),
+)

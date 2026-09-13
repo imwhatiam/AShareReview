@@ -2,18 +2,38 @@
 
 from dataclasses import dataclass
 import json
+import logging
 import re
-from time import sleep
+from time import perf_counter, sleep
 from typing import Any
 
 import requests
 from django.core.exceptions import ImproperlyConfigured
 
 from backend.env import get_required_setting, get_setting
+from core.api.errors import ErrorCode
+from core.logging import elapsed_ms, log_event
+
+
+logger = logging.getLogger(__name__)
+
+
+# 上游单页的硬上限：`st` 超过它会被服务端当成坏请求。定义在这里而不是散落成
+# 字面量，因为读路径的"一次修复至多 80 行"这个结论就是从它推出来的。
+MAX_PAGE_SIZE = 80
 
 
 class KaipanlaUnavailableError(RuntimeError):
     """The upstream service did not complete a usable request."""
+
+
+class KaipanlaRateLimitError(KaipanlaUnavailableError):
+    """The upstream service refused the request because we are being throttled.
+
+    Subclassed so every existing ``except KaipanlaUnavailableError`` still
+    catches it, while the read path can answer ``503 UPSTREAM_RATE_LIMITED``
+    instead of retrying into a throttled endpoint.
+    """
 
 
 class KaipanlaPayloadError(RuntimeError):
@@ -64,8 +84,10 @@ def _non_negative_float_setting(name: str) -> float:
 def flow_client_settings() -> KaipanlaSectorFundFlowClientSettings:
     """Read all Kaipanla flow endpoint parameters from the repository .env."""
     page_size = _positive_integer_setting('KAIPANLA_FLOW_PAGE_SIZE', minimum=1)
-    if page_size > 80:
-        raise ImproperlyConfigured('KAIPANLA_FLOW_PAGE_SIZE must not exceed 80.')
+    if page_size > MAX_PAGE_SIZE:
+        raise ImproperlyConfigured(
+            f'KAIPANLA_FLOW_PAGE_SIZE must not exceed {MAX_PAGE_SIZE}.'
+        )
     return KaipanlaSectorFundFlowClientSettings(
         endpoint=get_required_setting('KAIPANLA_API_URL'),
         device_id=get_setting('KPL_DEVICE_ID', '') or '',
@@ -94,10 +116,12 @@ class KaipanlaSectorFundFlowClient:
         self.sleep = sleep_fn or sleep
 
     def fetch_page(self, offset: int) -> dict[str, Any]:
+        """Fetch one page; retries live in the fetcher, so failures are terminal here."""
         if offset < 0 or offset % self.settings.page_size:
             raise ValueError('Kaipanla page offset must be a non-negative page boundary.')
         if self.settings.request_delay_seconds:
             self.sleep(self.settings.request_delay_seconds)
+        started_at = perf_counter()
         try:
             response = self.transport.post(
                 self.settings.endpoint,
@@ -114,9 +138,37 @@ class KaipanlaSectorFundFlowClient:
                 timeout=self.settings.timeout_seconds,
             )
         except requests.RequestException as error:
+            log_event(
+                logger,
+                'upstream_failed',
+                level=logging.WARNING,
+                provider='kaipanla_flow',
+                offset=offset,
+                duration_ms=elapsed_ms(started_at),
+                error=error,
+                error_code=ErrorCode.UPSTREAM_UNAVAILABLE.value,
+            )
             raise KaipanlaUnavailableError('Kaipanla request could not be completed.') from error
         if not 200 <= response.status_code < 300:
+            log_event(
+                logger,
+                'upstream_failed',
+                level=logging.WARNING,
+                provider='kaipanla_flow',
+                offset=offset,
+                status=response.status_code,
+                duration_ms=elapsed_ms(started_at),
+            )
+            if response.status_code == 429:
+                raise KaipanlaRateLimitError('Kaipanla request was throttled.')
             raise KaipanlaUnavailableError('Kaipanla request returned a non-success status.')
+        logger.debug(
+            '%s provider=kaipanla_flow offset=%s status=%s duration_ms=%s',
+            'upstream_ok',
+            offset,
+            response.status_code,
+            elapsed_ms(started_at),
+        )
         return self._decode_payload(response.text)
 
     def _form_data(self, offset: int) -> dict[str, str]:

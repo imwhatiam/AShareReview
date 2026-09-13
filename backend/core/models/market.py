@@ -25,14 +25,9 @@ class TradingDay(models.Model):
 
 
 class IndustrySnapshot(models.Model):
-    class Level(models.TextChoices):
-        PARENT = 'parent', '父行业'
-        CHILD = 'child', '子行业'
-
     industry_code = models.CharField(max_length=32, unique=True)
     industry_name = models.CharField(max_length=64)
-    industry_level = models.CharField(max_length=6, choices=Level.choices)
     stock_codes = models.JSONField(default=list)
 
     class Meta:
-        ordering = ['industry_level', 'industry_code']
+        ordering = ['industry_code']

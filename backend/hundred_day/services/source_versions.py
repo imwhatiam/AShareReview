@@ -1,25 +1,13 @@
-"""Resolve the current complete public industry-mapping version."""
+"""Public source versions consumed by this module.
 
-from core.models import DataVersion
+Re-exported from ``core`` so all three post-close modules resolve the industry
+mapping identically; business modules must not import each other
+(``db_router`` / the isolation tests enforce it), but ``core`` is the shared
+layer they are all allowed to depend on.
+"""
 
-INDUSTRY_SNAPSHOT_DATASET = 'industry_snapshot'
-
-
-class CompleteIndustrySnapshotUnavailable(LookupError):
-    """Raised when no complete Kaipanla industry mapping has been published."""
-
-
-def get_complete_industry_snapshot_version() -> str:
-    version = (
-        DataVersion.objects.filter(
-            dataset_key=INDUSTRY_SNAPSHOT_DATASET,
-            status=DataVersion.Status.COMPLETE,
-        )
-        .order_by('-last_success_at', '-started_at')
-        .first()
-    )
-    if version is None:
-        raise CompleteIndustrySnapshotUnavailable(
-            'No complete Kaipanla industry snapshot is available.'
-        )
-    return version.version
+from core.services.industry_snapshot import (  # noqa: F401
+    INDUSTRY_SNAPSHOT_DATASET,
+    CompleteIndustrySnapshotUnavailable,
+    get_complete_industry_snapshot_version,
+)

@@ -13,12 +13,16 @@ APPROVED_REQUEST_CLIENTS = {
     'core/integrations/hithink/client.py',
     'core/integrations/kaipanla/client.py',
     'kaipanla/services/client.py',
-    'eastmoney/services/client.py',
 }
 HITHINK_ENDPOINTS = {
     '/api/meta/tickers/list',
     '/api/a-share/calendar/trading-days',
     '/api/a-share/prices/historical',
+    # 全市场实时行情快照：盘中半小时刷新所有个股当日交易数据的通道。
+    '/api/a-share/prices/snapshot',
+    # 881 行业成分股：用来补齐开盘啦给不出北交所归属的那批股票。
+    '/api/a-share-index/catalog/ths-index-list',
+    '/api/a-share-index/constituents/ths-stock-list',
 }
 FORBIDDEN_STOCK_SOURCE_TERMS = (
     'baostock',
@@ -63,7 +67,7 @@ class SourcePolicyTests(SimpleTestCase):
         self.assertIn("get_required_setting('HITHINK_FINANCE_API_KEY')", source)
 
     def test_business_apps_do_not_bypass_the_controlled_hithink_adapter(self):
-        for module_id in ('kaipanla', 'eastmoney', 'stock_moves', 'sector_momentum', 'hundred_day'):
+        for module_id in ('kaipanla', 'stock_moves', 'sector_momentum', 'hundred_day'):
             for source_path in (BACKEND_ROOT / module_id).rglob('*.py'):
                 source = source_path.read_text(encoding='utf-8').lower()
                 with self.subTest(module_id=module_id, source_path=source_path):

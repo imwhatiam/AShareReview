@@ -17,7 +17,7 @@ class Migration(migrations.Migration):
                 ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
                 ('industry_code', models.CharField(max_length=32, unique=True)),
                 ('industry_name', models.CharField(max_length=64)),
-                ('industry_level', models.CharField(choices=[('parent', '父行业'), ('child', '子行业')], max_length=6)),
+                ('industry_level', models.CharField(choices=[('parent', '板块'), ('child', '子行业')], max_length=6)),
                 ('stock_codes', models.JSONField(default=list)),
             ],
             options={

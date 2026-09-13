@@ -1,4 +1,5 @@
 import json
+import logging
 
 from django.contrib.auth import authenticate
 from django.contrib.auth import login as django_login
@@ -8,7 +9,15 @@ from django.views.decorators.http import require_GET, require_POST
 
 from core.api.errors import ApiError, ErrorCode
 from core.api.responses import api_success
+from core.logging import log_event
 from core.module_registry import get_enabled_modules
+from core.services import login_throttle
+
+# 独立的 core.auth 名字：鉴权事件是安全审计要单独筛的一类，混在 core.views 里
+# 就得靠消息文本区分。只记录「谁在什么时候失败了」，绝不记录密码或凭据原文。
+auth_logger = logging.getLogger('core.auth')
+
+logger = logging.getLogger(__name__)
 
 
 def _user_summary(user):
@@ -61,21 +70,60 @@ def session(request):
 @require_POST
 def login(request):
     username, password = _credentials(request)
+    client_address = request.META.get('REMOTE_ADDR') or 'unknown'
+    # 先看失败预算再看密码：锁定期间连密码比对都不做，也不区分「用户名不存在 /
+    # 密码错误 / 账号停用」，日志粒度与响应一致。
+    if login_throttle.is_locked(username, client_address):
+        log_event(
+            auth_logger,
+            'login_throttled',
+            level=logging.WARNING,
+            username=username,
+        )
+        return ApiError(
+            ErrorCode.TOO_MANY_ATTEMPTS,
+            '登录失败次数过多，请稍后再试。',
+            http_status=429,
+        ).as_response()
+
     user = authenticate(request, username=username, password=password)
     if not username or not password or user is None or not user.is_active:
+        # 失败原因不区分「用户不存在 / 密码错误 / 账号停用」：日志里也保持同样
+        # 的粒度，避免把用户名枚举的结果顺手写进日志。
+        failures = (
+            login_throttle.record_failure(username, client_address) if username else 0
+        )
+        log_event(
+            auth_logger,
+            'login_rejected',
+            level=logging.WARNING,
+            username=username,
+            failures=failures,
+        )
         return ApiError(
             ErrorCode.AUTH_REQUIRED,
             '用户名或密码错误。',
             http_status=401,
         ).as_response()
 
+    login_throttle.clear(username, client_address)
     django_login(request, user)
+    log_event(auth_logger, 'login_succeeded', user_id=user.pk, username=user.get_username())
     return _session_response(request)
 
 
 @require_POST
 def logout(request):
+    user = request.user
+    # 先把身份读出来再登出：django_logout 会把 request.user 换成 AnonymousUser。
+    actor = (
+        {'user_id': user.pk, 'username': user.get_username()}
+        if getattr(user, 'is_authenticated', False)
+        else None
+    )
     django_logout(request)
+    if actor is not None:
+        log_event(auth_logger, 'logout', **actor)
     return _session_response(request)
 
 
@@ -100,8 +148,55 @@ def modules(request):
 
 
 def csrf_failure(request, reason=''):
+    """Answer a CSRF rejection with its own error code, not ``INVALID_PARAMETER``.
+
+    The HTTP status was always right (403), but the code was not: it told the
+    client "one of your parameters is wrong", which is indistinguishable from a
+    genuine bad-request and sends the user hunting for a bug in the form instead of
+    reloading an expired page. ``CSRF_FAILED`` is a state the caller can act on
+    (re-fetch the token / re-login), so it gets its own code.
+
+    Django calls this view for both a missing/expired token and a failed
+    ``Origin``/``Referer`` check, so the reason is logged — that is the difference
+    between "会话过期" and "反代把 Origin 改掉了".
+    """
+    log_event(
+        auth_logger,
+        'csrf_rejected',
+        level=logging.WARNING,
+        reason=reason,
+        path=request.path,
+        error_code=ErrorCode.CSRF_FAILED.value,
+    )
     return ApiError(
-        ErrorCode.INVALID_PARAMETER,
-        'CSRF 验证失败。',
+        ErrorCode.CSRF_FAILED,
+        'CSRF 验证失败，请刷新页面后重试。',
         http_status=403,
     ).as_response()
+
+
+def module_disabled_view(module):
+    """Answer every request under a disabled module's prefix with JSON.
+
+    A disabled module used to fall through to Django's HTML 404, so a caller
+    could not tell "this module is switched off" (a stable, declared
+    ``MODULE_DISABLED``) from "this URL does not exist", and the response broke
+    the "every /api/ answer is a JSON envelope" contract.
+    """
+
+    def disabled(request):
+        log_event(
+            logger,
+            'module_disabled',
+            module_id=module.module_id,
+            path=request.path,
+            error_code=ErrorCode.MODULE_DISABLED.value,
+        )
+        return ApiError(
+            ErrorCode.MODULE_DISABLED,
+            f'模块「{module.display_name}」当前未启用。',
+            http_status=404,
+        ).as_response()
+
+    disabled.__name__ = f'disabled_{module.module_id}'
+    return disabled

@@ -63,7 +63,7 @@ class Migration(migrations.Migration):
                 ('rank', models.PositiveIntegerField(verbose_name='组内排序')),
                 ('stock_code', models.CharField(max_length=6, verbose_name='股票代码')),
                 ('stock_name', models.CharField(max_length=64, verbose_name='股票名称')),
-                ('parent_industries', models.JSONField(default=list, verbose_name='开盘啦父行业快照')),
+                ('parent_industries', models.JSONField(default=list, verbose_name='开盘啦板块快照')),
                 ('change_percent', models.DecimalField(decimal_places=6, max_digits=12, verbose_name='涨跌幅（%）')),
                 ('turnover', models.DecimalField(decimal_places=4, max_digits=24, verbose_name='成交额（元）')),
                 ('result', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='items', to='stock_moves.stockmoveresult', verbose_name='分析结果')),

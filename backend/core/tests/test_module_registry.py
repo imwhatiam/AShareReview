@@ -30,3 +30,22 @@ class ModuleRegistryTests(SimpleTestCase):
         self.assertEqual(module.api_prefix, '/api/kaipanla/')
         self.assertEqual(module.navigation_group, 'fund_flow')
         self.assertTrue(module.requires_login)
+
+    def test_blank_module_list_falls_back_to_every_module(self):
+        """`ENABLED_MODULES=`（手滑多打一个等号）不能让全站功能静默消失。"""
+        from core.module_registry import MODULES, get_enabled_modules
+
+        with patch.dict(os.environ, {'ENABLED_MODULES': ''}, clear=False):
+            self.assertEqual(
+                [module.module_id for module in get_enabled_modules()],
+                [module.module_id for module in MODULES],
+            )
+
+    def test_an_explicitly_empty_module_list_is_rejected_loudly(self):
+        from django.core.exceptions import ImproperlyConfigured
+
+        from core.module_registry import get_enabled_modules
+
+        with patch.dict(os.environ, {'ENABLED_MODULES': ','}, clear=False):
+            with self.assertRaisesMessage(ImproperlyConfigured, 'ENABLED_MODULES'):
+                get_enabled_modules()

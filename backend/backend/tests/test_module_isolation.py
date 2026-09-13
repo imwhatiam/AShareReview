@@ -16,7 +16,6 @@ BACKEND_ROOT = PROJECT_ROOT / 'backend'
 BUSINESS_APP_IDS = tuple(BUSINESS_APP_DATABASES)
 MODULE_COMMANDS = {
     'kaipanla': 'fetch_kaipanla_sector_fund_flow',
-    'eastmoney': 'fetch_eastmoney_sector_fund_flow',
     'stock_moves': 'build_stock_moves',
     'sector_momentum': 'build_sector_momentum',
     'hundred_day': 'build_hundred_day',
@@ -55,7 +54,7 @@ def _relation_targets(source_path: Path) -> set[str]:
 
 
 class ModuleIsolationTests(SimpleTestCase):
-    def test_registry_and_database_router_cover_exactly_five_business_apps(self):
+    def test_registry_and_database_router_cover_exactly_four_business_apps(self):
         self.assertEqual(tuple(module.module_id for module in MODULES), BUSINESS_APP_IDS)
         self.assertEqual(set(BUSINESS_APP_DATABASES.values()), set(BUSINESS_APP_IDS))
 

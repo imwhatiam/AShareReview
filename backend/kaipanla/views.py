@@ -1,10 +1,20 @@
-"""Authenticated JSON endpoints for the Kaipanla business module."""
+"""Authenticated JSON endpoints for the Kaipanla business module.
+
+This module builds its handlers by hand instead of calling
+``core.api.read_endpoints.build_read_endpoints``: the factory's "this day
+cannot be produced" contract is the post-close pair (404 for a named date, 202
+for the default entry), while Kaipanla's read path answers ``202 DATA_PREPARING``
+for the default entry while today's collection is still in its window and
+``404 DATA_NOT_AVAILABLE`` otherwise. It never calls an upstream, so it has no
+503 and no 409. The request-side helpers it *does* share — auth, ``?date=``, the
+success envelope — come from ``core.api.handlers``.
+"""
 
 from django.views.decorators.http import require_GET
 
-from core.api.errors import ApiError, ErrorCode
-from core.api.responses import api_success
-from core.api.validators import parse_iso_date, parse_rank_count, parse_window_days
+from core.api.errors import ApiError
+from core.api.handlers import optional_date, require_authenticated, success
+from core.api.validators import parse_rank_count, parse_window_days
 from kaipanla.services.read_path import (
     read_intraday,
     read_intraday_history,
@@ -13,29 +23,8 @@ from kaipanla.services.read_path import (
 )
 
 
-def _require_authenticated(request):
-    if not request.user.is_authenticated:
-        raise ApiError(ErrorCode.AUTH_REQUIRED, '请先登录。', http_status=401)
-
-
-def _optional_date(request):
-    value = request.GET.get('date')
-    return None if value is None else parse_iso_date(value)
-
-
 def _rank_count(request, name: str, default: int = 5) -> int:
     return default if name not in request.GET else parse_rank_count(request.GET[name], name)
-
-
-def _success(result):
-    return api_success(
-        data=result.data,
-        business_date=result.business_date,
-        data_version=result.data_version,
-        source=result.source,
-        stale=result.stale,
-        warnings=list(result.warnings),
-    )
 
 
 def _handle(handler):
@@ -51,8 +40,8 @@ def sectors(request):
 
 
 def _sectors(request):
-    _require_authenticated(request)
-    return _success(read_sectors(_optional_date(request)))
+    require_authenticated(request)
+    return success(read_sectors(optional_date(request)))
 
 
 @require_GET
@@ -61,9 +50,9 @@ def intraday(request):
 
 
 def _intraday(request):
-    _require_authenticated(request)
-    return _success(read_intraday(
-        _optional_date(request),
+    require_authenticated(request)
+    return success(read_intraday(
+        optional_date(request),
         inflow_top=_rank_count(request, 'inflow_top'),
         outflow_top=_rank_count(request, 'outflow_top'),
     ))
@@ -75,10 +64,10 @@ def intraday_history(request):
 
 
 def _intraday_history(request):
-    _require_authenticated(request)
+    require_authenticated(request)
     days = 5 if 'days' not in request.GET else parse_window_days(request.GET['days'])
-    return _success(read_intraday_history(
-        _optional_date(request),
+    return success(read_intraday_history(
+        optional_date(request),
         days=days,
         inflow_top=_rank_count(request, 'inflow_top'),
         outflow_top=_rank_count(request, 'outflow_top'),
@@ -91,5 +80,5 @@ def dates(request):
 
 
 def _dates(request):
-    _require_authenticated(request)
-    return _success(read_dates())
+    require_authenticated(request)
+    return success(read_dates())

@@ -1,10 +1,9 @@
-from datetime import date, datetime
+from datetime import datetime
 
 from django.test import TestCase
 from django.utils import timezone
 
-from core.models import TradingDay
-from kaipanla.services.intraday import is_trading_day, resolve_snapshot_slot, session_slot
+from kaipanla.services.intraday import resolve_snapshot_slot, session_slot
 
 
 class SessionSlotTests(TestCase):
@@ -56,57 +55,12 @@ class SessionSlotTests(TestCase):
         self.assertIsNone(session_slot(self.local(2026, 9, 11, 3, 0)))
 
 
-class TradingDayFlagTests(TestCase):
-    """交易日判定：周末与法定节假日都不算交易日（chinese-calendar + 同花顺日历）。"""
-
-    databases = {'default'}
-
-    def test_weekends_are_not_trading_days(self):
-        self.assertFalse(is_trading_day(date(2026, 9, 12)))  # 周六
-        self.assertFalse(is_trading_day(date(2026, 9, 13)))  # 周日
-
-    def test_in_lieu_working_weekends_are_still_not_trading_days(self):
-        """调休上班的周末：国家日历算工作日，但交易所休市。"""
-        self.assertFalse(is_trading_day(date(2026, 9, 20)))  # 周日调休上班
-        self.assertFalse(is_trading_day(date(2026, 5, 9)))  # 周六调休上班
-        self.assertFalse(is_trading_day(date(2026, 1, 4)))  # 周日调休上班
-
-    def test_statutory_holidays_on_weekdays_are_not_trading_days(self):
-        self.assertFalse(is_trading_day(date(2026, 10, 1)))  # 国庆，周四
-        self.assertFalse(is_trading_day(date(2026, 1, 1)))  # 元旦，周四
-        self.assertFalse(is_trading_day(date(2026, 2, 17)))  # 春节，周二
-
-    def test_ordinary_weekdays_are_trading_days_even_without_a_synced_calendar(self):
-        """不能因为同花顺日历还没同步到今天就把交易日误判成节假日。"""
-        self.assertFalse(TradingDay.objects.exists())
-
-        self.assertTrue(is_trading_day(date(2026, 9, 11)))  # 周五
-        self.assertTrue(is_trading_day(date(2026, 9, 14)))  # 周一
-
-    def test_chinese_calendar_decides_a_weekday_even_when_the_synced_calendar_lacks_it(self):
-        """有节假日数据的年份以 chinese-calendar 为准，这样日历没同步到当天也不会误判。"""
-        TradingDay.objects.create(trade_date=date(2026, 9, 15))
-
-        self.assertTrue(is_trading_day(date(2026, 9, 14)))
-        self.assertTrue(is_trading_day(date(2026, 9, 15)))
-
-    def test_year_without_holiday_data_falls_back_to_the_synced_calendar(self):
-        """chinese-calendar 只内置到 2026 年；之后退回同花顺日历，不再自己猜节假日。"""
-        TradingDay.objects.create(trade_date=date(2027, 1, 5))
-
-        self.assertTrue(is_trading_day(date(2027, 1, 5)))  # 日历里有这一行
-        self.assertFalse(is_trading_day(date(2027, 1, 4)))  # 日历已覆盖该日却没有它
-        self.assertTrue(is_trading_day(date(2027, 1, 6)))  # 日历还没到该日，按工作日处理
-
-
 class ResolveSnapshotSlotTests(TestCase):
-    """写入侧唯一的槽位判定：交易日回退到已到的槽，非交易日回退到上一交易日收盘。"""
+    """写入侧唯一的槽位判定：交易日回退到已到的槽，非交易日回退到上一交易日收盘。
 
-    def setUp(self):
-        TradingDay.objects.bulk_create([
-            TradingDay(trade_date=date(2026, 9, 10)),
-            TradingDay(trade_date=date(2026, 9, 11)),
-        ])
+    交易日由 `core.services.calendar` 按 `chinese-calendar` 判定；本地已没有日历
+    表，所以"上一交易日"永远解析得出来，不再有"缺日历无法归属"的分支。
+    """
 
     def local(self, *parts):
         return timezone.make_aware(datetime(*parts))
@@ -143,10 +97,17 @@ class ResolveSnapshotSlotTests(TestCase):
                 )
 
     def test_statutory_holiday_run_lands_on_the_previous_trading_close(self):
-        """2026-10-01 国庆（周四）休市，采集应归到 09-11 的收盘而不是当天槽位。"""
+        """2026-10-01 国庆（周四）休市，采集应归到 09-30 的收盘而不是当天槽位。"""
         self.assertEqual(
             resolve_snapshot_slot(self.local(2026, 10, 1, 10, 0)),
-            self.local(2026, 9, 11, 15, 0),
+            self.local(2026, 9, 30, 15, 0),
+        )
+
+    def test_the_last_day_of_a_closure_lands_on_the_day_before_it(self):
+        """国庆连休 10-01 至 10-07，10-07 运行仍归到 09-30 的收盘。"""
+        self.assertEqual(
+            resolve_snapshot_slot(self.local(2026, 10, 7, 10, 0)),
+            self.local(2026, 9, 30, 15, 0),
         )
 
     def test_pre_open_run_on_a_trading_day_lands_on_the_previous_trading_close(self):
@@ -155,15 +116,9 @@ class ResolveSnapshotSlotTests(TestCase):
             self.local(2026, 9, 10, 15, 0),
         )
 
-    def test_weekday_beyond_the_calendar_window_counts_as_a_trading_day(self):
-        # 日历最晚只到 09-11：09-14 当作交易日，否则当天数据会覆盖 09-11 的收盘快照。
+    def test_pre_open_run_after_a_closure_lands_on_the_last_close_before_it(self):
+        """10-08 开盘前运行：上一交易日是 09-30，不是连休里的任何一天。"""
         self.assertEqual(
-            resolve_snapshot_slot(self.local(2026, 9, 14, 10, 3)),
-            self.local(2026, 9, 14, 10, 0),
+            resolve_snapshot_slot(self.local(2026, 10, 8, 9, 20)),
+            self.local(2026, 9, 30, 15, 0),
         )
-
-    def test_missing_calendar_cannot_assign_a_snapshot(self):
-        TradingDay.objects.all().delete()
-
-        with self.assertRaises(ValueError):
-            resolve_snapshot_slot(self.local(2026, 9, 12, 6, 41))

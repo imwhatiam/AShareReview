@@ -78,7 +78,7 @@ function MetricSection({ metric, title, rankings, expanded, onToggle }) {
 export default function SectorMomentumPage({ apiClient }) {
   const [date, setDate] = useState('')
   const { values: expanded, toggle: toggleExpanded } = useToggleSet()
-  const { phase, envelope, refreshedAt } = useSectorMomentum({ apiClient, date })
+  const { phase, envelope, updatedAt, refresh } = useSectorMomentum({ apiClient, date })
 
   /*
    * 本页不展示告警列表：后端唯一会发的告警是「N 只有效股票未映射到开盘啦板块」，
@@ -99,7 +99,7 @@ export default function SectorMomentumPage({ apiClient }) {
       toolbar={(
         <>
           <DatePicker id="sector-momentum-date" value={displayDate} onChange={setDate} />
-          <RefreshStamp refreshedAt={refreshedAt} />
+          <RefreshStamp updatedAt={updatedAt} onRefresh={refresh} />
           {/* 成交额依赖数据，没数据时整组不渲染。 */}
           {data && (
             <div className="stat-grid">

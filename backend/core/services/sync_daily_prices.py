@@ -1,34 +1,36 @@
-"""One-time initialization and daily synchronization for public A-share prices."""
+"""Initialization, weekly revision and intraday refresh for public A-share prices.
 
-from dataclasses import dataclass, replace
+Three write paths share this dataset, all of them keyed by
+``(stock, trade_date)`` and all of them comparing business values before writing:
+
+- :func:`refresh_intraday_daily_prices` — the *only* scheduled writer. One paged
+  whole-market snapshot request refreshes "today" every half hour.
+- :func:`initialize_stock_daily_prices` — the weekly full-window revision. It
+  walks the year of per-stock history, which is also what repairs anything the
+  snapshot could not express (a re-listing stock's previous close, a day that was
+  never written).
+"""
+
+from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from uuid import uuid4
 
 from django.core.exceptions import ImproperlyConfigured
 from django.db import transaction
-from django.utils import timezone
 
 from backend.env import get_setting
 from core.integrations.hithink.client import HithinkClient
 from core.integrations.hithink.contracts import HithinkPriceBar, HithinkQuoteSnapshot
 from core.logging import ProgressReporter, log_command_progress
-from core.models import DailyPrice, DataVersion, Stock, TradingDay
+from core.models import DailyPrice, Stock
+from core.services import calendar as trading_calendar
 from core.services.calendar import latest_eligible_trading_day
-from core.services.market_data import STOCK_DAILY_PRICES_DATASET
-from core.services.publication import (
-    PublicationRun,
-    begin_publication,
-    fail_publication,
-    finish_publication,
-    supersede_previous_versions,
-)
-from core.services.run_status import mark_failed
 
 
 _CHANGE_PERCENT_PRECISION = Decimal('0.000001')
-# 比对只看业务字段：source_batch_id / source_data_version 每次运行都不同，
-# 把它们算进差异会让每次重跑都判定为“全部有变化”。
+# 比对只看业务字段：source_batch_id 每次运行都不同，把它算进差异会让每次重跑都
+# 判定为“全部有变化”。
 _COMPARED_PRICE_FIELDS = (
     'pre_close',
     'open_price',
@@ -70,14 +72,7 @@ def _active_stocks() -> tuple[Stock, ...]:
 
 
 def _trading_days_between(start_date: date, end_date: date) -> tuple[date, ...]:
-    trading_days = tuple(
-        TradingDay.objects.filter(
-            trade_date__gte=start_date,
-            trade_date__lte=end_date,
-        )
-        .order_by('trade_date')
-        .values_list('trade_date', flat=True)
-    )
+    trading_days = trading_calendar.trading_days_between(start_date, end_date)
     if not trading_days:
         raise ValueError('No trading days are available for the requested range.')
     return trading_days
@@ -133,17 +128,9 @@ def _build_daily_prices(
     bars: tuple[HithinkPriceBar, ...],
     trading_days: tuple[date, ...],
     source_batch_id: str,
-    versions_by_date: dict[date, str] | None = None,
     previous_close: Decimal | None = None,
 ) -> tuple[DailyPrice, ...]:
-    """Build the rows for one stock.
-
-    ``versions_by_date`` may be omitted: initialization must compare the freshly
-    built rows against the stored ones *before* it can know which trading days need
-    a new version, so the data version is stamped afterwards.
-    """
     bars_by_date = _validate_bars(bars, trading_days)
-    version_by_date = versions_by_date or {}
     records = []
     for trade_date in trading_days:
         bar = bars_by_date.get(trade_date)
@@ -167,26 +154,11 @@ def _build_daily_prices(
                 turnover=bar.turnover if bar else None,
                 has_valid_trade=has_valid_trade,
                 source_batch_id=source_batch_id,
-                source_data_version=version_by_date.get(trade_date, ''),
             )
         )
         if has_valid_trade:
             previous_close = bar.close_price
     return tuple(records)
-
-
-def _previous_valid_close(stock: Stock, before_date: date) -> Decimal | None:
-    record = (
-        DailyPrice.objects.filter(
-            stock=stock,
-            trade_date__lt=before_date,
-            has_valid_trade=True,
-            close_price__isnull=False,
-        )
-        .order_by('-trade_date')
-        .first()
-    )
-    return record.close_price if record is not None else None
 
 
 def _stored_price_values(
@@ -236,42 +208,13 @@ def _split_changed_records(
     return tuple(changed), unchanged_count, changed_by_date
 
 
-def _begin_runs(trading_days: tuple[date, ...], expected_record_count: int):
-    """Open one publication run per trading day, never leaving a RUNNING orphan.
-
-    ``tuple(begin_publication(...) for ...)`` looks equivalent but is not: if the
-    third call raises, the first two ``DataVersion`` rows are **already committed**
-    (``begin_publication`` is not wrapped in an outer transaction) while the
-    caller's ``runs`` variable is still empty — so its ``_fail_runs`` cleanup
-    iterates nothing and the orphans stay ``RUNNING`` forever. ``init_*`` over a
-    year of trading days turns that into dozens of them. Building the list
-    incrementally and failing each created run on the way out keeps the audit
-    trail truthful.
-    """
-    runs: list[PublicationRun] = []
-    try:
-        for trading_day in trading_days:
-            runs.append(
-                begin_publication(
-                    'core',
-                    STOCK_DAILY_PRICES_DATASET,
-                    trading_day,
-                    expected_record_count,
-                )
-            )
-    except Exception as error:
-        for created in runs:
-            fail_publication(created, error)
-        raise
-    for run in runs:
-        DataVersion.objects.filter(version=run.version).update(
-            coverage_start_date=run.business_date,
-            coverage_end_date=run.business_date,
-        )
-    return tuple(runs)
-
-
 def _upsert(records: tuple[DailyPrice, ...]) -> None:
+    """Write the rows that differ; the transaction that wraps this is the publication.
+
+    ``source_batch_id`` is deliberately not an update field: it answers "which
+    batch first wrote this row", and restamping an unchanged row would rewrite a
+    whole trading day of rows for a value nothing reads.
+    """
     DailyPrice.objects.bulk_create(
         records,
         batch_size=500,
@@ -286,80 +229,8 @@ def _upsert(records: tuple[DailyPrice, ...]) -> None:
             'volume',
             'turnover',
             'has_valid_trade',
-            'source_batch_id',
-            'source_data_version',
         ],
         unique_fields=['stock', 'trade_date'],
-    )
-
-
-def _complete_runs(runs: tuple[PublicationRun, ...], actual_record_count: int) -> None:
-    for run in runs:
-        finish_publication(run, actual_record_count, 0)
-
-
-def _complete_covering_runs(runs: tuple[PublicationRun, ...]) -> None:
-    """Finish each run with the row count that actually carries it.
-
-    An incremental rerun only re-stamps the affected trading days, so the covered
-    count — not the active stock count — is what makes a version complete. Getting
-    this wrong publishes a ``partial`` version, which the read path then ignores.
-
-    The same re-stamping also empties the *previous* version of that day, so the
-    versions it replaced are retired here too; otherwise the admin list keeps
-    showing several "complete" versions with full counts for one business day.
-    """
-    for run in runs:
-        covered = DailyPrice.objects.filter(
-            trade_date=run.business_date,
-            source_data_version=run.version,
-        ).count()
-        if covered == 0:
-            raise ValueError(
-                f'The new daily-price version for {run.business_date.isoformat()} covers no rows.'
-            )
-        DataVersion.objects.filter(version=run.version).update(expected_record_count=covered)
-        finish_publication(replace(run, expected_record_count=covered), covered, 0)
-        supersede_previous_versions(
-            STOCK_DAILY_PRICES_DATASET, run.business_date, keep_version=run.version
-        )
-
-
-def _fail_runs(
-    runs: tuple[PublicationRun, ...],
-    error: Exception,
-    *,
-    business_date: date | None = None,
-    mark_status: bool = True,
-) -> None:
-    running_runs = tuple(
-        run
-        for run in runs
-        if DataVersion.objects.filter(
-            version=run.version,
-            status=DataVersion.Status.RUNNING,
-        ).exists()
-    )
-    if not running_runs:
-        # 发布前就失败（抓取/比对阶段）时没有版本可标，但运行状态仍要记失败，
-        # 否则页面无法区分“这次尝试失败了”和“从未运行过”。dry-run 不改变运行状态。
-        if mark_status:
-            mark_failed('core', STOCK_DAILY_PRICES_DATASET, business_date, str(error))
-        return
-    DataVersion.objects.filter(
-        version__in=[run.version for run in running_runs],
-        status=DataVersion.Status.RUNNING,
-    ).update(
-        status=DataVersion.Status.FAILED,
-        finished_at=timezone.now(),
-        error_summary=str(error)[:1000],
-    )
-    latest_run = running_runs[-1]
-    mark_failed(
-        latest_run.module_id,
-        latest_run.dataset_key,
-        latest_run.business_date,
-        str(error),
     )
 
 
@@ -374,197 +245,85 @@ def initialize_stock_daily_prices(*, years: int = 1, dry_run: bool = False):
         raise ValueError('Only a one-year initial daily-price import is supported.')
 
     end_date = latest_eligible_trading_day()
-    if end_date is None:
-        raise ValueError('No eligible trading day is available for initialization.')
     trading_days = _trading_days_between(_one_year_before(end_date), end_date)
     stocks = _active_stocks()
     client = HithinkClient()
     source_batch_id = uuid4().hex
     is_initial_import = not DailyPrice.objects.exists()
-    runs: tuple[PublicationRun, ...] = ()
-    try:
-        bars_by_stock = {}
-        # 逐只股票一次远端请求：这是初始化里最长的阶段，按股票报进度。
-        fetch_progress = ProgressReporter(
-            'stock_daily_prices', total=len(stocks), mode='initialize', phase='fetch'
+
+    bars_by_stock = {}
+    # 逐只股票一次远端请求：这是初始化里最长的阶段，按股票报进度。
+    fetch_progress = ProgressReporter(
+        'stock_daily_prices', total=len(stocks), mode='initialize', phase='fetch'
+    )
+    fetch_progress.start(action='started', trading_days=len(trading_days))
+    for stock in stocks:
+        bars = client.get_historical_prices(
+            stock.thscode,
+            start_date=trading_days[0],
+            end_date=trading_days[-1],
         )
-        fetch_progress.start(action='started', trading_days=len(trading_days))
-        for stock in stocks:
-            bars = client.get_historical_prices(
-                stock.thscode,
-                start_date=trading_days[0],
-                end_date=trading_days[-1],
-            )
-            _validate_bars(bars, trading_days)
-            bars_by_stock[stock.pk] = bars
-            fetch_progress.advance(stock=stock.stock_code, bars=len(bars))
-        fetch_progress.report(force=True, action='fetched')
-        _validate_market_coverage(bars_by_stock, trading_days)
+        _validate_bars(bars, trading_days)
+        bars_by_stock[stock.pk] = bars
+        fetch_progress.advance(stock=stock.stock_code, bars=len(bars))
+    fetch_progress.report(force=True, action='fetched')
+    _validate_market_coverage(bars_by_stock, trading_days)
 
-        build_progress = ProgressReporter('stock_daily_prices', total=len(stocks), phase='build')
-        build_progress.start(action='started')
-        records: list[DailyPrice] = []
-        for stock in stocks:
-            records.extend(
-                _build_daily_prices(
-                    stock=stock,
-                    bars=bars_by_stock[stock.pk],
-                    trading_days=trading_days,
-                    source_batch_id=source_batch_id,
-                )
+    build_progress = ProgressReporter('stock_daily_prices', total=len(stocks), phase='build')
+    build_progress.start(action='started')
+    records: list[DailyPrice] = []
+    for stock in stocks:
+        records.extend(
+            _build_daily_prices(
+                stock=stock,
+                bars=bars_by_stock[stock.pk],
+                trading_days=trading_days,
+                source_batch_id=source_batch_id,
             )
-            build_progress.advance(stock=stock.stock_code, records=len(records))
-        build_progress.report(force=True, action='built')
-        built_records = tuple(records)
-
-        log_command_progress('stock_daily_prices', action='comparing', records=len(built_records))
-        stored = _stored_price_values([stock.pk for stock in stocks], trading_days)
-        changed_records, unchanged_record_count, changed_by_date = _split_changed_records(
-            built_records, stored
         )
-        changed_dates = tuple(sorted(changed_by_date))
-        log_command_progress(
-            'stock_daily_prices',
-            action='compared',
-            records=len(built_records),
-            changed=len(changed_records),
-            unchanged=unchanged_record_count,
-            trading_days=len(changed_dates),
-        )
+        build_progress.advance(stock=stock.stock_code, records=len(records))
+    build_progress.report(force=True, action='built')
+    built_records = tuple(records)
 
-        if dry_run:
-            return DailyPriceSyncResult(
-                trading_day_count=len(trading_days),
-                record_count=len(built_records),
-                dry_run=True,
-                changed_record_count=len(changed_records),
-                unchanged_record_count=unchanged_record_count,
-                updated_trading_day_count=len(changed_dates),
-                is_up_to_date=not changed_dates,
-                is_initial_import=is_initial_import,
-            )
+    log_command_progress('stock_daily_prices', action='comparing', records=len(built_records))
+    stored = _stored_price_values([stock.pk for stock in stocks], trading_days)
+    changed_records, unchanged_record_count, changed_by_date = _split_changed_records(
+        built_records, stored
+    )
+    changed_dates = tuple(sorted(changed_by_date))
+    log_command_progress(
+        'stock_daily_prices',
+        action='compared',
+        records=len(built_records),
+        changed=len(changed_records),
+        unchanged=unchanged_record_count,
+        trading_days=len(changed_dates),
+    )
 
-        if not changed_dates:
-            # 与上游逐条一致：不发布新版本。发一个内容相同的新版本只会让下游
-            # （个股异动 / 板块动量 / 百日新高）因为 source version 变化而全量重建。
-            return DailyPriceSyncResult(
-                trading_day_count=len(trading_days),
-                record_count=len(built_records),
-                dry_run=False,
-                unchanged_record_count=unchanged_record_count,
-                is_up_to_date=True,
-                is_initial_import=is_initial_import,
-            )
-
-        runs = _begin_runs(changed_dates, len(stocks))
-        versions_by_date = {run.business_date: run.version for run in runs}
-        for record in changed_records:
-            record.source_data_version = versions_by_date[record.trade_date]
-        if any(not record.source_data_version for record in changed_records):
-            raise ValueError('Daily-price records must carry a data version before publication.')
-
-        log_command_progress(
-            'stock_daily_prices',
-            action='writing',
-            phase='write',
-            records=len(changed_records),
-            trading_days=len(changed_dates),
-        )
-        with transaction.atomic():
-            _upsert(changed_records)
-            # 读路径按 source_data_version 过滤，所以受影响的交易日必须整体改归属：
-            # 只刷新变化行，会让那一日仍挂在旧版本名下的行被读路径丢掉。
-            for trade_date, version in versions_by_date.items():
-                DailyPrice.objects.filter(trade_date=trade_date).update(
-                    source_data_version=version,
-                    source_batch_id=source_batch_id,
-                )
-            _complete_covering_runs(runs)
-    except Exception as error:
-        _fail_runs(runs, error, business_date=end_date, mark_status=not dry_run)
-        raise
-
-    return DailyPriceSyncResult(
+    result = DailyPriceSyncResult(
         trading_day_count=len(trading_days),
         record_count=len(built_records),
-        dry_run=False,
+        dry_run=dry_run,
         changed_record_count=len(changed_records),
         unchanged_record_count=unchanged_record_count,
         updated_trading_day_count=len(changed_dates),
+        is_up_to_date=not changed_dates,
         is_initial_import=is_initial_import,
     )
+    if dry_run or not changed_dates:
+        # 与上游逐条一致时什么都不写：重写一遍内容相同的行只会无端改动落库时刻。
+        return result
 
-
-def sync_stock_daily_prices(*, trade_date: date, dry_run: bool = False):
-    if not TradingDay.objects.filter(trade_date=trade_date).exists():
-        raise ValueError('The requested date is not in the trading calendar.')
-    stocks = _active_stocks()
-    client = HithinkClient()
-    source_batch_id = uuid4().hex
-    runs: tuple[PublicationRun, ...] = ()
-    if not dry_run:
-        runs = _begin_runs((trade_date,), len(stocks))
-    try:
-        # 逐只股票一次远端请求（几千次），必须按股票报进度。
-        fetch_progress = ProgressReporter(
-            'stock_daily_prices', total=len(stocks), phase='fetch', trade_date=trade_date
-        )
-        fetch_progress.start(action='started')
-        price_inputs = []
-        for stock in stocks:
-            bars = client.get_historical_prices(
-                stock.thscode,
-                start_date=trade_date,
-                end_date=trade_date,
-            )
-            price_inputs.append((stock, bars, _previous_valid_close(stock, trade_date)))
-            fetch_progress.advance(stock=stock.stock_code, bars=len(bars))
-        fetch_progress.report(force=True, action='fetched')
-        price_inputs = tuple(price_inputs)
-
-        bars_by_stock = {}
-        for stock, bars, _ in price_inputs:
-            _validate_bars(bars, (trade_date,))
-            bars_by_stock[stock.pk] = bars
-        _validate_market_coverage(bars_by_stock, (trade_date,))
-
-        if dry_run:
-            return DailyPriceSyncResult(1, len(stocks), True)
-
-        versions_by_date = {trade_date: runs[0].version}
-        build_progress = ProgressReporter(
-            'stock_daily_prices', total=len(stocks), phase='build', trade_date=trade_date
-        )
-        build_progress.start(action='started')
-        records = []
-        for stock, bars, previous_close in price_inputs:
-            records.extend(
-                _build_daily_prices(
-                    stock=stock,
-                    bars=bars,
-                    trading_days=(trade_date,),
-                    source_batch_id=source_batch_id,
-                    versions_by_date=versions_by_date,
-                    previous_close=previous_close,
-                )
-            )
-            build_progress.advance(stock=stock.stock_code, records=len(records))
-        build_progress.report(force=True, action='built')
-        records = tuple(records)
-        log_command_progress(
-            'stock_daily_prices',
-            action='writing',
-            phase='write',
-            trade_date=trade_date,
-            records=len(records),
-        )
-        with transaction.atomic():
-            _upsert(records)
-            _complete_runs(runs, len(stocks))
-    except Exception as error:
-        _fail_runs(runs, error, business_date=trade_date, mark_status=not dry_run)
-        raise
-    return DailyPriceSyncResult(1, len(records), False)
+    log_command_progress(
+        'stock_daily_prices',
+        action='writing',
+        phase='write',
+        records=len(changed_records),
+        trading_days=len(changed_dates),
+    )
+    with transaction.atomic():
+        _upsert(changed_records)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -576,7 +335,7 @@ def sync_stock_daily_prices(*, trade_date: date, dry_run: bool = False):
 _INTRADAY_QUOTE_MAX_PAGES = 50
 _INTRADAY_QUOTE_PAGE_SIZE_DEFAULT = 1000
 # 快照缺了股票往往意味着分页截断或上游抖动。低于这个覆盖率就整体失败，绝不
-# 把半截数据标成 complete —— 那会让四个页面读到一份“看起来完整”的假行情。
+# 把半截数据写进“当天” —— 那会让四个页面读到一份“看起来完整”的假行情。
 _INTRADAY_QUOTE_MIN_COVERAGE_DEFAULT = '0.95'
 
 
@@ -649,7 +408,7 @@ def _quote_has_valid_trade(quote: HithinkQuoteSnapshot) -> bool:
     """A suspended stock arrives with ``last_price: null`` and zero volume.
 
     Every price is stored as ``None`` in that case: writing the upstream zeros
-    instead would satisfy the "all fields present" check and publish a fake
+    instead would satisfy the "all fields present" check and record a fake
     trade.
     """
     return all(
@@ -678,14 +437,7 @@ def _previous_closes(trade_date: date) -> dict[int, Decimal]:
     upstream ``price_change_ratio_pct`` is computed against the raw previous
     close and is therefore wrong for our series.
     """
-    previous_day = (
-        TradingDay.objects.filter(trade_date__lt=trade_date)
-        .order_by('-trade_date')
-        .values_list('trade_date', flat=True)
-        .first()
-    )
-    if previous_day is None:
-        return {}
+    previous_day = trading_calendar.previous_trading_day(trade_date)
     return dict(
         DailyPrice.objects.filter(
             trade_date=previous_day,
@@ -707,9 +459,17 @@ def _build_intraday_records(
 
     Stocks missing from the snapshot are skipped rather than zeroed: a missing
     code means "we did not hear about it", which must not be recorded as a
-    suspended session. Gap-filling stays the job of the post-close historical
-    sync, which is authoritative and will also correct the low-order rounding
-    the snapshot introduces on ``volume`` / ``turnover``.
+    suspended session. Filling such a gap — and recomputing the previous close of
+    a stock that resumes trading after a suspension — stays the job of
+    :func:`initialize_stock_daily_prices`, which reads one year of per-stock
+    history instead of one instant of the whole market.
+
+    实测（2026-09-15 收盘后对拍两条口径）：四个价格字段与 ``has_valid_trade``
+    完全一致；``turnover`` 有约 76% 的行存在 1e-9 量级的浮点差（10 亿级上绝对差
+    数十元），历史上由盘后历史同步纠正。**但 ``volume`` / ``turnover`` 对 4 只
+    北交所标的（如 920045）反而只有快照是对的**，历史日线比真实成交少 3%~25%，
+    所以"历史口径一定更准"不成立；这也正是历史同步命令被撤掉、只保留本路径与
+    每周全量校正的原因之一。
     """
     records = []
     for stock in stocks:
@@ -737,8 +497,6 @@ def _build_intraday_records(
                 turnover=quote.turnover if has_valid_trade else None,
                 has_valid_trade=has_valid_trade,
                 source_batch_id=source_batch_id,
-                # 版本号要等发布开始时才知道，这里先留空，比对不看这个字段。
-                source_data_version='',
             )
         )
     return tuple(records)
@@ -749,116 +507,85 @@ def refresh_intraday_daily_prices(
 ) -> IntradayQuoteRefreshResult:
     """Refresh one trading day's public prices from the live market snapshot.
 
-    Intended to run every half hour during the session so the three derived
-    modules can follow "today" while it is still trading. It is the same
-    dataset and the same publication contract as :func:`sync_stock_daily_prices`
-    — only the transport differs (one whole-market page walk instead of one
-    request per stock), so the rows it writes carry the same semantics.
+    This is the only routine writer of this dataset. It runs every half hour
+    during the session (and once more after the close with ``--latest``) so the
+    three derived modules can follow "today" while it is still trading. The
+    transport is one whole-market page walk — about six requests — instead of one
+    request per stock, which is what makes that cadence affordable and what keeps
+    a transient upstream rejection from costing the day's data.
 
-    A run that finds nothing new publishes nothing: an unchanged content would
-    otherwise force every downstream module to rebuild for a version bump that
-    carries no new data. The trade-off is that an intraday run *does* publish a
-    new version whenever the market moved, which is every run during the
-    session; the post-close historical sync remains the authority that fixes
-    the snapshot's rounding.
+    A run that finds nothing new writes nothing, so an unchanged snapshot does
+    not touch the day's rows at all.
     """
-    if not TradingDay.objects.filter(trade_date=trade_date).exists():
-        raise ValueError('The requested date is not in the trading calendar.')
+    if not trading_calendar.is_trading_day(trade_date):
+        raise ValueError('The requested date is not a trading day.')
     stocks = _active_stocks()
     source_batch_id = uuid4().hex
-    runs: tuple[PublicationRun, ...] = ()
-    try:
-        log_command_progress(
-            'stock_daily_prices', action='fetching_intraday_quotes', trade_date=trade_date
-        )
-        quotes = _fetch_market_quotes(
-            client or HithinkClient(), page_size=_intraday_quote_page_size()
-        )
-        matched = tuple(stock for stock in stocks if stock.thscode in quotes)
-        coverage_ratio = Decimal(len(matched)) / Decimal(len(stocks))
-        minimum_ratio = _intraday_min_coverage_ratio()
-        log_command_progress(
-            'stock_daily_prices',
-            action='fetched_intraday_quotes',
-            trade_date=trade_date,
-            quotes=len(quotes),
-            matched=len(matched),
-            coverage=str(coverage_ratio),
-        )
-        if coverage_ratio < minimum_ratio:
-            raise ValueError(
-                f'The intraday snapshot covers {coverage_ratio:.4f} of the active market, '
-                f'below the required {minimum_ratio}.'
-            )
 
-        records = _build_intraday_records(
-            stocks=matched,
-            quotes=quotes,
-            previous_closes=_previous_closes(trade_date),
-            trade_date=trade_date,
-            source_batch_id=source_batch_id,
-        )
-        stored = _stored_price_values([stock.pk for stock in matched], (trade_date,))
-        changed_records, unchanged_record_count, _ = _split_changed_records(records, stored)
-        log_command_progress(
-            'stock_daily_prices',
-            action='compared',
-            trade_date=trade_date,
-            records=len(records),
-            changed=len(changed_records),
-            unchanged=unchanged_record_count,
+    log_command_progress(
+        'stock_daily_prices', action='fetching_intraday_quotes', trade_date=trade_date
+    )
+    quotes = _fetch_market_quotes(
+        client or HithinkClient(), page_size=_intraday_quote_page_size()
+    )
+    matched = tuple(stock for stock in stocks if stock.thscode in quotes)
+    coverage_ratio = Decimal(len(matched)) / Decimal(len(stocks))
+    minimum_ratio = _intraday_min_coverage_ratio()
+    log_command_progress(
+        'stock_daily_prices',
+        action='fetched_intraday_quotes',
+        trade_date=trade_date,
+        quotes=len(quotes),
+        matched=len(matched),
+        coverage=str(coverage_ratio),
+    )
+    if coverage_ratio < minimum_ratio:
+        raise ValueError(
+            f'The intraday snapshot covers {coverage_ratio:.4f} of the active market, '
+            f'below the required {minimum_ratio}.'
         )
 
-        if dry_run:
-            return IntradayQuoteRefreshResult(
-                trade_date=trade_date,
-                quote_count=len(quotes),
-                matched_stock_count=len(matched),
-                coverage_ratio=coverage_ratio,
-                changed_record_count=len(changed_records),
-                unchanged_record_count=unchanged_record_count,
-                published=False,
-                is_up_to_date=not changed_records,
-                dry_run=True,
-            )
+    records = _build_intraday_records(
+        stocks=matched,
+        quotes=quotes,
+        previous_closes=_previous_closes(trade_date),
+        trade_date=trade_date,
+        source_batch_id=source_batch_id,
+    )
+    stored = _stored_price_values([stock.pk for stock in matched], (trade_date,))
+    changed_records, unchanged_record_count, _ = _split_changed_records(records, stored)
+    log_command_progress(
+        'stock_daily_prices',
+        action='compared',
+        trade_date=trade_date,
+        records=len(records),
+        changed=len(changed_records),
+        unchanged=unchanged_record_count,
+    )
 
-        if not changed_records:
-            return IntradayQuoteRefreshResult(
-                trade_date=trade_date,
-                quote_count=len(quotes),
-                matched_stock_count=len(matched),
-                coverage_ratio=coverage_ratio,
-                changed_record_count=0,
-                unchanged_record_count=unchanged_record_count,
-                published=False,
-                is_up_to_date=True,
-                dry_run=False,
-            )
+    result = IntradayQuoteRefreshResult(
+        trade_date=trade_date,
+        quote_count=len(quotes),
+        matched_stock_count=len(matched),
+        coverage_ratio=coverage_ratio,
+        changed_record_count=len(changed_records),
+        unchanged_record_count=unchanged_record_count,
+        published=False,
+        is_up_to_date=not changed_records,
+        dry_run=dry_run,
+    )
+    if dry_run or not changed_records:
+        return result
 
-        runs = _begin_runs((trade_date,), len(matched))
-        version = runs[0].version
-        for record in changed_records:
-            record.source_data_version = version
-        log_command_progress(
-            'stock_daily_prices',
-            action='writing',
-            phase='write',
-            trade_date=trade_date,
-            records=len(changed_records),
-        )
-        with transaction.atomic():
-            _upsert(changed_records)
-            # 读路径按 source_data_version 过滤，所以“当天”必须整体改归属新版本，
-            # 否则未被本次改动到的行会被读路径丢掉。
-            DailyPrice.objects.filter(trade_date=trade_date).update(
-                source_data_version=version,
-                source_batch_id=source_batch_id,
-            )
-            _complete_covering_runs(runs)
-    except Exception as error:
-        _fail_runs(runs, error, business_date=trade_date, mark_status=not dry_run)
-        raise
-
+    log_command_progress(
+        'stock_daily_prices',
+        action='writing',
+        phase='write',
+        trade_date=trade_date,
+        records=len(changed_records),
+    )
+    with transaction.atomic():
+        _upsert(changed_records)
     return IntradayQuoteRefreshResult(
         trade_date=trade_date,
         quote_count=len(quotes),

@@ -5,7 +5,6 @@ from django.test import SimpleTestCase
 
 from core.services.contracts import (
     CompleteMarketSnapshot,
-    MarketDataVersion,
     MarketPrice,
     Industry,
 )
@@ -35,7 +34,7 @@ class SectorMomentumAnalysisTests(SimpleTestCase):
 
     def _snapshot(self, prices, industries):
         return CompleteMarketSnapshot(
-            data_version=MarketDataVersion('daily-prices-v1', self.business_date),
+            business_date=self.business_date,
             prices=tuple(prices),
             industries=tuple(industries),
         )
@@ -51,7 +50,7 @@ class SectorMomentumAnalysisTests(SimpleTestCase):
             [Industry('I1', '行业甲', ('600001', '600002', '600003'))],
         )
 
-        analysis = build_sector_momentum_analysis(snapshot, 'industry-v1')
+        analysis = build_sector_momentum_analysis(snapshot)
 
         ranking = analysis.rankings_by_metric['above_5pct'][0]
         self.assertEqual(ranking.stock_count, 2)
@@ -72,7 +71,7 @@ class SectorMomentumAnalysisTests(SimpleTestCase):
             [Industry('I1', '行业甲', ('600001',)), Industry('I2', '行业乙', ('600003',))],
         )
 
-        analysis = build_sector_momentum_analysis(snapshot, 'industry-v1')
+        analysis = build_sector_momentum_analysis(snapshot)
 
         rankings = analysis.rankings_by_metric['top_5_percent']
         # 3 只有效股票 → 5% 向下取整为 0，由 max(1, …) 下限抬到 1：样本只含涨幅
@@ -93,7 +92,7 @@ class SectorMomentumAnalysisTests(SimpleTestCase):
             ],
         )
 
-        analysis = build_sector_momentum_analysis(snapshot, 'industry-v1')
+        analysis = build_sector_momentum_analysis(snapshot)
 
         self.assertEqual(analysis.unmapped_stock_count, 1)
         self.assertEqual(analysis.total_market_turnover, Decimal('400'))
@@ -109,7 +108,7 @@ class SectorMomentumAnalysisTests(SimpleTestCase):
             [Industry('I1', '行业甲', ('600001',))],
         )
 
-        analysis = build_sector_momentum_analysis(snapshot, 'industry-v1')
+        analysis = build_sector_momentum_analysis(snapshot)
 
         self.assertEqual(analysis.total_market_turnover, Decimal('0'))
         self.assertEqual(analysis.rankings_by_metric['above_5pct'], ())

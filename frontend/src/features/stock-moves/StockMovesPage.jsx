@@ -14,7 +14,7 @@ const ERROR_MESSAGE = '大涨跌幅与大成交量个股数据暂时无法加载
 export default function StockMovesPage({ apiClient }) {
   const [date, setDate] = useState('')
   const [copyResult, setCopyResult] = useState(null)
-  const { phase, envelope, refreshedAt } = useStockMoves({ apiClient, date })
+  const { phase, envelope, updatedAt, refresh } = useStockMoves({ apiClient, date })
 
   const data = envelope?.data ?? null
   const stateName = resolveDataStateName(phase, envelope, { hasContent: Boolean(data) })
@@ -39,7 +39,7 @@ export default function StockMovesPage({ apiClient }) {
       toolbar={(
         <>
           <DatePicker id="stock-moves-date" value={displayDate} onChange={setDate} />
-          <RefreshStamp refreshedAt={refreshedAt} />
+          <RefreshStamp updatedAt={updatedAt} onRefresh={refresh} />
           {/* "复制"依赖数据，没数据时不渲染。 */}
           {data && (
             <div className="toolbar__actions">

@@ -4,21 +4,12 @@ from datetime import datetime, time
 
 from django.utils import timezone
 
-from core.models import TradingDay
+from core.services.calendar import recent_trading_days
 from kaipanla.services.intraday import validate_ranking_limits
-from kaipanla.services.queries import load_close_snapshot_rows, published_version_strings
+from kaipanla.services.queries import load_close_snapshot_rows
 
 SUPPORTED_HISTORY_WINDOWS = frozenset({1, 5, 10, 20})
 CLOSE_TIME = time(15, 0)
-
-
-def trading_day_window(end_date, *, count):
-    """Return up to ``count`` public trading dates ending on or before ``end_date``."""
-    return list(
-        TradingDay.objects.filter(trade_date__lte=end_date).order_by('-trade_date').values_list(
-            'trade_date', flat=True
-        )[:count]
-    )
 
 
 def _close_time(trade_date):
@@ -63,11 +54,9 @@ def query_intraday_history(end_date, *, days=5, inflow_top=5, outflow_top=5):
         raise ValueError('days must be one of 1, 5, 10, or 20.')
     validate_ranking_limits(inflow_top, outflow_top)
 
-    trade_dates = trading_day_window(end_date, count=days)
+    trade_dates = recent_trading_days(end_date, count=days)
     close_times = [_close_time(trade_date) for trade_date in trade_dates]
-    snapshot_rows = load_close_snapshot_rows(
-        trade_dates, close_times, published_version_strings(trade_dates)
-    )
+    snapshot_rows = load_close_snapshot_rows(trade_dates, close_times)
     rankings = _period_rankings(snapshot_rows, inflow_top, outflow_top)
     selected_codes = [
         item['code']

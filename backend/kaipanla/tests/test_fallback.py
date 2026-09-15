@@ -1,55 +1,132 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase
 from django.utils import timezone
 
-from core.api.errors import ErrorCode
-from core.models import DataVersion, TradingDay
-from core.services.file_cache import FileCache
+from core.api.errors import ApiError, ErrorCode
 from core.services.cache_keys import build_cache_key
+from core.services.file_cache import FileCache
 from kaipanla.models import KaipanlaSectorFundFlowSnapshot
-from kaipanla.services.read_path import RepairOutcome
 
 
-class KaipanlaReadFallbackTests(TestCase):
-    databases = {'default', 'kaipanla'}
+def frozen_at(*parts):
+    """Fix "now" at the given Shanghai moment.
+
+    The default entry asks the clock two things — which trading day should
+    already have a snapshot, and whether today's collection can still be on its
+    way — so the tests that exercise it have to stop time. Everything else here
+    depends on the database alone.
+    """
+    return patch(
+        'django.utils.timezone.now',
+        return_value=timezone.make_aware(datetime(*parts)),
+    )
+
+
+def store(trade_date, hour=15, minute=0, code='A', name='甲行业', net_inflow='100000000'):
+    """Append one sector row to a slot, exactly as a collection would."""
+    return KaipanlaSectorFundFlowSnapshot.objects.using('kaipanla').create(
+        sector_code=code,
+        sector_name=name,
+        trade_date=trade_date,
+        snapshot_time=timezone.make_aware(
+            datetime(trade_date.year, trade_date.month, trade_date.day, hour, minute)
+        ),
+        main_net_inflow=Decimal(net_inflow),
+    )
+
+
+class KaipanlaExpectedSnapshotDateTests(SimpleTestCase):
+    """默认入口只回答"该有快照的最新交易日"，不碰公共日行情日期。"""
+
+    def test_before_the_open_a_trading_day_is_not_expected_yet(self):
+        from kaipanla.services.read_path import _latest_expected_snapshot_date
+
+        with frozen_at(2026, 9, 9, 8, 30):
+            self.assertEqual(
+                _latest_expected_snapshot_date(), datetime(2026, 9, 8).date()
+            )
+
+    def test_a_trading_day_is_expected_from_its_first_snapshot_slot_on(self):
+        from kaipanla.services.read_path import _latest_expected_snapshot_date
+
+        for hour, minute in ((9, 30), (11, 30), (12, 20), (15, 0), (23, 59)):
+            with frozen_at(2026, 9, 9, hour, minute):
+                self.assertEqual(
+                    _latest_expected_snapshot_date(),
+                    datetime(2026, 9, 9).date(),
+                    f'{hour:02d}:{minute:02d} 已开盘，当天就该有快照',
+                )
+
+    def test_a_non_trading_day_keeps_the_previous_trading_day(self):
+        from kaipanla.services.read_path import _latest_expected_snapshot_date
+
+        with frozen_at(2026, 9, 12, 10, 0):  # 周六
+            self.assertEqual(
+                _latest_expected_snapshot_date(), datetime(2026, 9, 11).date()
+            )
+
+    def test_today_counts_as_still_collecting_until_the_close(self):
+        """盘中（含午休）"今天还没有快照"可以是"还在路上"，页面该稍后再来。"""
+        from kaipanla.services.read_path import _today_is_still_collecting
+
+        for parts in ((2026, 9, 9, 9, 31), (2026, 9, 9, 12, 0), (2026, 9, 9, 14, 59)):
+            with self.subTest(parts=parts), frozen_at(*parts):
+                self.assertTrue(_today_is_still_collecting())
+
+    def test_after_the_close_or_on_a_holiday_today_is_not_collecting(self):
+        """收盘后与休市日不能再承诺"准备中"：那时的缺失就是缺失。"""
+        from kaipanla.services.read_path import _today_is_still_collecting
+
+        for parts in ((2026, 9, 9, 15, 0), (2026, 9, 9, 20, 0), (2026, 9, 12, 10, 0)):
+            with self.subTest(parts=parts), frozen_at(*parts):
+                self.assertFalse(_today_is_still_collecting())
+
+
+class KaipanlaReadPathHasNoUpstreamTests(SimpleTestCase):
+    """读路径没有回源能力 —— 这是删掉 Web 侧远程修复后的核心不变量。"""
+
+    def test_the_read_path_imports_no_upstream_client(self):
+        from kaipanla.services import read_path
+
+        for name in (
+            'KaipanlaSectorFundFlowFetcher',
+            'KaipanlaSectorFundFlowClient',
+            'flow_client_settings',
+        ):
+            self.assertFalse(
+                hasattr(read_path, name),
+                f'读路径不该再有回源能力（{name}）；数据一律来自库与文件缓存。',
+            )
+
+    def test_the_deleted_repair_vocabulary_is_gone(self):
+        from kaipanla.services import read_path
+
+        for name in (
+            'RepairOutcome',
+            '_repair_current_snapshot',
+            '_can_attempt_repair',
+            'REPAIR_MAX_PAGES',
+            'REPAIR_MAX_ROWS',
+        ):
+            self.assertFalse(hasattr(read_path, name), f'{name} 应随修复链路一起删除。')
+
+
+class KaipanlaReadPathTests(TestCase):
+    databases = {'kaipanla'}
 
     def setUp(self):
         self.trade_date = datetime(2026, 9, 8).date()
-        TradingDay.objects.create(trade_date=self.trade_date)
-        KaipanlaSectorFundFlowSnapshot.objects.using('kaipanla').create(
-            sector_code='A',
-            sector_name='甲行业',
-            trade_date=self.trade_date,
-            snapshot_time=timezone.make_aware(datetime(2026, 9, 8, 15, 0)),
-            main_net_inflow=Decimal('100000000'),
-            source_data_version='kaipanla-fallback-version',
-            source_batch_id='published-snapshot',
-        )
-        DataVersion.objects.create(
-            dataset_key='kaipanla_sector_fund_flow',
-            version='kaipanla-fallback-version',
-            business_date=self.trade_date,
-            status=DataVersion.Status.COMPLETE,
-            expected_record_count=1,
-            actual_record_count=1,
-        )
+        store(self.trade_date)
         self.cache_directory = TemporaryDirectory()
         self.cache = FileCache(self.cache_directory.name, ttl_seconds=300, max_bytes=1_000_000)
         self.addCleanup(self.cache_directory.cleanup)
 
-    def patch_now(self, *parts):
-        """修复只服务当天，因此把"现在"固定在交易日盘中。"""
-        return patch(
-            'django.utils.timezone.now',
-            return_value=timezone.make_aware(datetime(*parts)),
-        )
-
     @patch('kaipanla.services.read_path.default_file_cache')
-    def test_corrupt_cache_falls_back_to_published_database_data(self, cache_factory):
+    def test_corrupt_cache_falls_back_to_database_data(self, cache_factory):
         from kaipanla.services.read_path import read_intraday
 
         cache_factory.return_value = self.cache
@@ -57,7 +134,7 @@ class KaipanlaReadFallbackTests(TestCase):
             'kaipanla',
             'sectors/intraday',
             {'date': '2026-09-08', 'inflow_top': 1, 'outflow_top': 1},
-            'kaipanla-fallback-version',
+            'kaipanla:2026-09-08T15:00',
         )
         path = self.cache.path_for(key)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -68,125 +145,98 @@ class KaipanlaReadFallbackTests(TestCase):
         self.assertEqual(result.source, 'database')
         self.assertEqual([item['code'] for item in result.data['series']], ['A'])
 
-    @patch('kaipanla.services.read_path._can_attempt_repair', return_value=True)
-    @patch(
-        'kaipanla.services.read_path._repair_current_snapshot',
-        return_value=RepairOutcome(False),
-    )
-    def test_missing_current_data_attempts_one_bounded_repair_then_reports_preparing(
-        self, repair, can_repair
+    @patch('kaipanla.services.read_path.default_file_cache', return_value=None)
+    def test_default_entry_follows_the_newest_stored_snapshot(self, cache):
+        """页面锚点是**本模块自己最新的快照日**，与公共日行情日期无关。
+
+        回归用例（2026-09-14 现场）：盘中当天快照已经落库，而
+        `stock_daily_prices` 当天还没有任何 complete 版本。旧实现锚定公共日行情
+        日期，于是首屏退回前一个交易日 —— 明明手里有当天数据却不肯显示。
+        """
+        from kaipanla.services.read_path import read_sectors
+
+        same_day = datetime(2026, 9, 9).date()
+        store(same_day, hour=10, minute=0)
+
+        with frozen_at(2026, 9, 9, 10, 5):
+            result = read_sectors()
+
+        self.assertEqual(result.business_date, same_day)
+        self.assertFalse(result.stale)
+        self.assertEqual(result.warnings, ())
+
+    @patch('kaipanla.services.read_path.default_file_cache', return_value=None)
+    def test_today_without_a_snapshot_answers_202_while_today_can_still_be_collected(
+        self, cache
     ):
-        from core.api.errors import ApiError, ErrorCode
-        from kaipanla.services.read_path import read_intraday
+        """今天该有还没有、而且还在盘中窗口内 → 202"正在准备中"，不拿昨天顶替。"""
+        from kaipanla.services.read_path import read_sectors
 
-        DataVersion.objects.all().delete()
-
-        with self.assertRaises(ApiError) as raised:
-            read_intraday(self.trade_date, inflow_top=1, outflow_top=1)
+        with frozen_at(2026, 9, 9, 10, 0), self.assertRaises(ApiError) as raised:
+            read_sectors()
 
         self.assertEqual(raised.exception.code, ErrorCode.DATA_PREPARING)
         self.assertEqual(raised.exception.http_status, 202)
-        can_repair.assert_called_once_with(self.trade_date)
-        repair.assert_called_once_with(self.trade_date)
-
-    @patch('kaipanla.services.read_path._can_attempt_repair', return_value=True)
-    @patch(
-        'kaipanla.services.read_path._repair_current_snapshot',
-        return_value=RepairOutcome(False, ErrorCode.UPSTREAM_RATE_LIMITED),
-    )
-    def test_a_throttled_upstream_answers_503_instead_of_202(self, repair, can_repair):
-        """限流是确定性失败：202 会让客户端对着一个正在限流的上游反复重试。"""
-        from core.api.errors import ApiError, ErrorCode
-        from kaipanla.services.read_path import read_intraday
-
-        DataVersion.objects.all().delete()
-
-        with self.assertRaises(ApiError) as raised:
-            read_intraday(self.trade_date, inflow_top=1, outflow_top=1)
-
-        self.assertEqual(raised.exception.code, ErrorCode.UPSTREAM_RATE_LIMITED)
-        self.assertEqual(raised.exception.http_status, 503)
 
     @patch('kaipanla.services.read_path.default_file_cache', return_value=None)
-    @patch('kaipanla.services.read_path.latest_complete_stock_price_date')
-    def test_default_entry_anchors_on_the_latest_public_daily_price_day(
-        self, latest_public, cache
-    ):
-        """四个页面必须对"最新一天"给出同一个答案（规格 §5.8a）。"""
+    def test_a_closed_day_without_a_snapshot_serves_the_newest_one_as_stale(self, cache):
+        """收盘后还是没有当天快照 → 如实返回最近可用快照并标 stale。
+
+        以前这里会一直回 202：缺失被说成"还在准备"。收盘之后那就不是准备，是缺失。
+        """
         from kaipanla.services.read_path import read_sectors
 
-        latest_public.return_value = self.trade_date
+        with frozen_at(2026, 9, 9, 15, 30):
+            result = read_sectors()
 
-        result = read_sectors()
+        self.assertEqual(result.business_date, self.trade_date)
+        self.assertTrue(result.stale)
+        self.assertIn('最近一次可用快照', result.warnings[0])
+
+    @patch('kaipanla.services.read_path.default_file_cache', return_value=None)
+    def test_a_non_trading_day_with_a_gap_serves_the_newest_one_as_stale(self, cache):
+        from kaipanla.services.read_path import read_sectors
+
+        with frozen_at(2026, 9, 12, 10, 0):  # 周六，最近交易日 09-11 没有快照
+            result = read_sectors()
+
+        self.assertEqual(result.business_date, self.trade_date)
+        self.assertTrue(result.stale)
+
+    @patch('kaipanla.services.read_path.default_file_cache', return_value=None)
+    def test_before_the_open_the_previous_close_is_served_without_a_warning(self, cache):
+        """开盘前"最新交易日"仍是上一个交易日：直接服务它，不是旧数据。"""
+        from kaipanla.services.read_path import read_sectors
+
+        with frozen_at(2026, 9, 9, 8, 30):
+            result = read_sectors()
 
         self.assertEqual(result.business_date, self.trade_date)
         self.assertFalse(result.stale)
         self.assertEqual(result.warnings, ())
 
-    @patch('kaipanla.services.read_path._can_attempt_repair', return_value=False)
     @patch('kaipanla.services.read_path.default_file_cache', return_value=None)
-    @patch('kaipanla.services.read_path.latest_complete_stock_price_date')
-    def test_an_anchor_day_without_a_snapshot_serves_the_newest_one_as_stale(
-        self, latest_public, cache, can_repair
-    ):
-        """锚定日还没有快照 → 退回最近一次快照，并如实标 stale（规格 §5.8.6）。"""
+    def test_no_stored_snapshot_is_404(self, cache):
         from kaipanla.services.read_path import read_sectors
 
-        latest_public.return_value = datetime(2026, 9, 9).date()
-
-        result = read_sectors()
-
-        self.assertEqual(result.business_date, self.trade_date)
-        self.assertTrue(result.stale)
-        self.assertIn('最近一次可用快照', result.warnings[0])
-
-    @patch('kaipanla.services.read_path._can_attempt_repair', return_value=True)
-    @patch(
-        'kaipanla.services.read_path._repair_current_snapshot',
-        return_value=RepairOutcome(False, ErrorCode.UPSTREAM_RATE_LIMITED),
-    )
-    @patch('kaipanla.services.read_path.default_file_cache', return_value=None)
-    @patch('kaipanla.services.read_path.latest_complete_stock_price_date')
-    def test_a_pending_repair_is_not_masked_by_old_data(
-        self, latest_public, cache, repair, can_repair
-    ):
-        """有旧数据也不该把"上游在限流"伪装成"数据有点旧"：状态必须还能看见。"""
-        from core.api.errors import ApiError
-        from kaipanla.services.read_path import read_sectors
-
-        latest_public.return_value = datetime(2026, 9, 9).date()
+        KaipanlaSectorFundFlowSnapshot.objects.using('kaipanla').all().delete()
 
         with self.assertRaises(ApiError) as raised:
             read_sectors()
 
-        self.assertEqual(raised.exception.code, ErrorCode.UPSTREAM_RATE_LIMITED)
-        self.assertEqual(raised.exception.http_status, 503)
+        self.assertEqual(raised.exception.code, ErrorCode.DATA_NOT_AVAILABLE)
+        self.assertEqual(raised.exception.http_status, 404)
 
-    @patch('kaipanla.services.read_path._can_attempt_repair', return_value=True)
-    @patch('kaipanla.services.read_path._repair_current_snapshot')
     @patch('kaipanla.services.read_path.default_file_cache', return_value=None)
-    @patch('kaipanla.services.read_path.latest_complete_stock_price_date')
-    def test_a_busy_dataset_serves_the_old_snapshot_as_stale(
-        self, latest_public, cache, repair, can_repair
-    ):
-        """数据集被别的任务占用但还有旧快照：返回旧快照并标 stale，而不是 409。
-
-        规格 §5.8a："其余请求立刻返回旧数据或 202"。四个业务模块现在都对占用给出
-        同一个答案，只有"连旧数据都没有"时才升格成 §5.7 的 409。
-        """
-        from core.services.locking import DatasetBusy
+    def test_an_explicit_date_without_rows_is_404_and_never_substituted(self, cache):
+        """用户点名了 09-07，库里没有 → 404，而不是把 09-08 当结果返回。"""
         from kaipanla.services.read_path import read_sectors
 
-        latest_public.return_value = datetime(2026, 9, 9).date()
-        repair.side_effect = DatasetBusy(
-            'kaipanla:kaipanla_sector_fund_flow is already running.'
-        )
+        with self.assertRaises(ApiError) as raised:
+            read_sectors(datetime(2026, 9, 7).date())
 
-        result = read_sectors()
-
-        self.assertEqual(result.business_date, self.trade_date)
-        self.assertTrue(result.stale)
-        self.assertIn('最近一次可用快照', result.warnings[0])
+        self.assertEqual(raised.exception.http_status, 404)
+        self.assertEqual(raised.exception.code, ErrorCode.DATA_NOT_AVAILABLE)
 
     @patch('kaipanla.services.read_path.default_file_cache', return_value=None)
     def test_an_explicit_date_is_never_reported_as_stale(self, cache):
@@ -199,214 +249,94 @@ class KaipanlaReadFallbackTests(TestCase):
         self.assertFalse(result.stale)
         self.assertEqual(result.warnings, ())
 
-    def test_the_repair_row_guard_is_a_constant_that_one_page_cannot_reach(self):
-        """行数闸门是常量，不是可运维旋钮。
+    @patch('kaipanla.services.read_path.default_file_cache')
+    def test_a_new_collected_slot_is_not_served_from_the_previous_slot_cache(
+        self, cache_factory
+    ):
+        """缓存身份 = 当天最新的采集槽：新槽一到，键就变，绝不会命中旧的载荷。"""
+        from kaipanla.services.read_path import read_intraday
 
-        一次修复只取一页，而上游单页硬上限就是 ``MAX_PAGE_SIZE``，所以正常永远
-        到不了闸门。它以前是 `.env` 里的 ``REMOTE_REPAIR_MAX_ROWS=1000``：调它
-        没有任何效果，却和两个真旋钮并列出现在 `.env` 和运维文档里。常量化的
-        同时保留判断，是因为它仍要挡住"上游无视 st 硬塞更多行"。
+        cache_factory.return_value = self.cache
+        # 槽位必须是标准交易槽 —— `query_intraday` 的时轴只有 09:30–15:00 的
+        # 50 个五分区，落在别处（如 15:05）的行读路径根本不看。
+        KaipanlaSectorFundFlowSnapshot.objects.using('kaipanla').all().delete()
+        store(self.trade_date, hour=14, minute=50)  # 1 亿
+        first_written_at = timezone.now() - timedelta(days=30)
+        KaipanlaSectorFundFlowSnapshot.objects.using('kaipanla').update(
+            created_at=first_written_at
+        )
+
+        first = read_intraday(self.trade_date, inflow_top=1, outflow_top=1)
+        second = read_intraday(self.trade_date, inflow_top=1, outflow_top=1)
+        store(self.trade_date, hour=14, minute=55, net_inflow='500000000')  # 5 亿
+        slot_written_at = timezone.now() - timedelta(days=3)
+        KaipanlaSectorFundFlowSnapshot.objects.using('kaipanla').filter(
+            snapshot_time=timezone.make_aware(datetime(2026, 9, 8, 14, 55))
+        ).update(created_at=slot_written_at)
+        third = read_intraday(self.trade_date, inflow_top=1, outflow_top=1)
+
+        self.assertEqual(first.source, 'database')
+        self.assertEqual(second.source, 'cache')
+        self.assertEqual(third.source, 'database')
+        self.assertEqual(third.cache_identity, 'kaipanla:2026-09-08T14:55')
+        self.assertEqual(third.data['series'][0]['latest_net_inflow'], 5.0)
+        # 时间戳每次请求都从库里重取（缓存只存载荷、不存信封），命中缓存也不例外：
+        # 漏传的表现是"页面刷过一次之后，胶囊上的时刻就没了"。
+        self.assertEqual(first.data_updated_at, first_written_at)
+        self.assertEqual(second.data_updated_at, first_written_at)
+        self.assertEqual(third.data_updated_at, slot_written_at)
+
+    @patch('kaipanla.services.read_path.default_file_cache', return_value=None)
+    def test_the_response_reports_when_the_stored_snapshot_was_written(self, cache):
+        """「更新于」取的是**库里这批快照的写入时刻**，不是这次请求的时刻。
+
+        快照落库后一直躺在库里，页面随时打开，两者可以差几个小时。这里把 setUp 里的
+        那一槽标成三十天前写的 —— 哪天它退化成 `timezone.now()`，这条立刻挂。
         """
-        from kaipanla.services.client import MAX_PAGE_SIZE
-        from kaipanla.services.fetcher import KaipanlaSectorFundFlowFetchResult
-        from kaipanla.services.parser import KaipanlaSectorFundFlowRow
-        from kaipanla.services.read_path import REPAIR_MAX_ROWS, _repair_discard_reason
+        from kaipanla.services.read_path import read_intraday
 
-        def fetch_result(row_count):
-            rows = tuple(
-                KaipanlaSectorFundFlowRow(
-                    sector_code=f'BK{index:03d}',
-                    sector_name=f'行业{index}',
-                    change_pct=None,
-                    main_net_inflow=Decimal('1'),
-                    main_buy=None,
-                    main_sell=None,
-                    large_order_net_inflow=None,
-                    volume_ratio=None,
-                    turnover_amount=None,
-                    float_market_cap=None,
-                    total_market_cap=None,
-                )
-                for index in range(row_count)
-            )
-            return KaipanlaSectorFundFlowFetchResult(
-                rows=rows,
-                is_complete=True,
-                expected_page_count=1,
-                completed_page_count=1,
-                failed_page_offsets=(),
-                source_timestamp=None,
-                source_trade_date='2026-09-08',
-            )
-
-        # 闸门上限必须与上游的单页上限同源，否则"一页不可能触顶"这个结论就是假的。
-        self.assertEqual(REPAIR_MAX_ROWS, MAX_PAGE_SIZE)
-
-        self.assertIsNone(
-            _repair_discard_reason(
-                fetch_result=fetch_result(REPAIR_MAX_ROWS),
-                elapsed_seconds=0.5,
-                hard_timeout=5,
-            )
-        )
-        reason, code = _repair_discard_reason(
-            fetch_result=fetch_result(REPAIR_MAX_ROWS + 1),
-            elapsed_seconds=0.5,
-            hard_timeout=5,
-        )
-        self.assertEqual(reason, 'row_budget_exceeded')
-        self.assertIsNone(code)
-
-    @patch('kaipanla.services.read_path._repair_current_snapshot')
-    @patch('kaipanla.services.read_path._can_attempt_repair', return_value=True)
-    def test_the_202_answer_carries_the_configured_retry_hint(self, can_repair, repair):
-        """202/503 里的 ``retry_after_seconds`` 读的是改名后的重试提示键。
-
-        它不是耗时预算：调大它不会让那次抓取有更多时间（那是
-        ``REMOTE_REPAIR_HARD_TIMEOUT_SECONDS`` 的事），所以旧名
-        ``REMOTE_REPAIR_TARGET_SECONDS`` 已经废掉。
-        """
-        from core.api.errors import ApiError
-        from kaipanla.services.read_path import _published_version
-
-        DataVersion.objects.all().delete()
-        repair.return_value = RepairOutcome(False)
-
-        with patch.dict(
-            'os.environ', {'REMOTE_REPAIR_RETRY_AFTER_SECONDS': '9'}, clear=False
-        ), self.assertRaises(ApiError) as caught:
-            _published_version(None)
-
-        self.assertEqual(caught.exception.code, ErrorCode.DATA_PREPARING)
-        self.assertEqual(caught.exception.http_status, 202)
-        self.assertEqual(caught.exception.retry_after_seconds, 9)
-
-    @patch('kaipanla.services.read_path.KaipanlaSectorFundFlowFetcher')
-    @patch('kaipanla.services.read_path.KaipanlaSectorFundFlowClient')
-    @patch('kaipanla.services.read_path.flow_client_settings')
-    def test_remote_repair_uses_one_page_no_retry_and_hard_timeout(
-        self, flow_settings, client_class, fetcher_class
-    ):
-        from kaipanla.services.client import KaipanlaSectorFundFlowClientSettings
-        from kaipanla.services.fetcher import KaipanlaSectorFundFlowFetchResult
-        from kaipanla.services.parser import KaipanlaSectorFundFlowRow
-        from kaipanla.services.read_path import _repair_current_snapshot
-
-        DataVersion.objects.all().delete()
-        flow_settings.return_value = KaipanlaSectorFundFlowClientSettings(
-            endpoint='https://example.invalid', device_id='device', user_id='', token='',
-            version='5.23.0.4', api_version='w44', phone_os_new='1', timeout_seconds=10,
-            controller='ZhiShuRanking', action='RealRankingInfo', order='1', ranking_type='1',
-            zs_type='7', page_size=80, request_delay_seconds=1.0,
-        )
-        fetcher_class.return_value.fetch.return_value = KaipanlaSectorFundFlowFetchResult(
-            rows=(KaipanlaSectorFundFlowRow(
-                sector_code='B', sector_name='乙行业', change_pct=None,
-                main_net_inflow=Decimal('200000000'), main_buy=None, main_sell=None,
-                large_order_net_inflow=None, volume_ratio=None, turnover_amount=None,
-                float_market_cap=None, total_market_cap=None,
-            ),),
-            is_complete=True, expected_page_count=1, completed_page_count=1,
-            failed_page_offsets=(), source_timestamp=int(
-                timezone.make_aware(datetime(2026, 9, 8, 15, 0)).timestamp()
-            ), source_trade_date='2026-09-08',
+        written_at = timezone.now() - timedelta(days=30)
+        KaipanlaSectorFundFlowSnapshot.objects.using('kaipanla').update(
+            created_at=written_at
         )
 
-        with self.patch_now(2026, 9, 8, 14, 30):
-            outcome = _repair_current_snapshot(self.trade_date)
+        result = read_intraday(self.trade_date, inflow_top=1, outflow_top=1)
 
-        self.assertTrue(outcome.published)
-        self.assertIsNone(outcome.upstream_code)
+        self.assertEqual(result.source, 'database')
+        self.assertEqual(result.data_updated_at, written_at)
 
-        client_settings = client_class.call_args.kwargs['settings']
-        self.assertEqual(client_settings.timeout_seconds, 5)
-        self.assertEqual(client_settings.request_delay_seconds, 0.0)
-        fetcher_class.assert_called_once_with(
-            client=client_class.return_value,
-            page_size=80,
-            max_pages=1,
-            max_retries=0,
-            retry_delay_seconds=0.0,
-        )
-        self.assertEqual(
-            DataVersion.objects.get(dataset_key='kaipanla_sector_fund_flow').status,
-            DataVersion.Status.COMPLETE,
+    @patch('kaipanla.services.read_path.default_file_cache', return_value=None)
+    def test_read_dates_reports_when_the_newest_day_was_written(self, cache):
+        """日期清单的信封也带时刻：它说的是"库里最新那批数据是什么时候写的"。"""
+        from kaipanla.services.read_path import read_dates
+
+        written_at = timezone.now() - timedelta(days=7)
+        KaipanlaSectorFundFlowSnapshot.objects.using('kaipanla').update(
+            created_at=written_at
         )
 
-    @patch('kaipanla.services.read_path.dataset_lock', side_effect=Exception('lock unavailable'))
-    def test_repair_failure_never_publishes_a_version(self, lock):
-        from kaipanla.services.read_path import _repair_current_snapshot
+        result = read_dates()
 
-        DataVersion.objects.all().delete()
+        self.assertEqual(result.data_updated_at, written_at)
 
-        with self.patch_now(2026, 9, 8, 14, 30):
-            outcome = _repair_current_snapshot(self.trade_date)
+    @patch('kaipanla.services.read_path.default_file_cache', return_value=None)
+    def test_read_dates_lists_every_stored_day_newest_first(self, cache):
+        from kaipanla.services.read_path import read_dates
 
-        self.assertFalse(outcome.published)
-        # 写侧/锁侧的失败不是"上游不可用"，不能被标成上游错误码。
-        self.assertIsNone(outcome.upstream_code)
-        self.assertFalse(DataVersion.objects.exists())
-        lock.assert_called_once_with('kaipanla', 'kaipanla_sector_fund_flow')
+        store(datetime(2026, 9, 9).date(), code='B', name='乙行业')
 
-    @patch('kaipanla.services.read_path.KaipanlaSectorFundFlowFetcher')
-    @patch('kaipanla.services.read_path.KaipanlaSectorFundFlowClient')
-    @patch('kaipanla.services.read_path.flow_client_settings')
-    def test_a_throttled_fetch_is_reported_as_rate_limited(
-        self, flow_settings, client_class, fetcher_class
-    ):
-        """抓取层只给出 failure_kind，读路径负责把它翻成稳定错误码。"""
-        from core.api.errors import ErrorCode
-        from kaipanla.services.client import KaipanlaSectorFundFlowClientSettings
-        from kaipanla.services.fetcher import KaipanlaSectorFundFlowFetchResult
-        from kaipanla.services.read_path import _repair_current_snapshot
+        result = read_dates()
 
-        DataVersion.objects.all().delete()
-        flow_settings.return_value = KaipanlaSectorFundFlowClientSettings(
-            endpoint='https://example.invalid', device_id='device', user_id='', token='',
-            version='5.23.0.4', api_version='w44', phone_os_new='1', timeout_seconds=10,
-            controller='ZhiShuRanking', action='RealRankingInfo', order='1', ranking_type='1',
-            zs_type='4', page_size=80, request_delay_seconds=1.0,
-        )
-        fetcher_class.return_value.fetch.return_value = KaipanlaSectorFundFlowFetchResult(
-            rows=(), is_complete=False, expected_page_count=1, completed_page_count=0,
-            failed_page_offsets=(0,), source_timestamp=None, source_trade_date=None,
-            error_summary='The first page failed.', failure_kind='rate_limited',
-        )
+        self.assertEqual(result.data['dates'], ['2026-09-09', '2026-09-08'])
+        self.assertEqual(result.business_date, datetime(2026, 9, 9).date())
 
-        with self.patch_now(2026, 9, 8, 14, 30):
-            outcome = _repair_current_snapshot(self.trade_date)
+    @patch('kaipanla.services.read_path.default_file_cache', return_value=None)
+    def test_read_dates_without_any_snapshot_is_404(self, cache):
+        from kaipanla.services.read_path import read_dates
 
-        self.assertFalse(outcome.published)
-        self.assertEqual(outcome.upstream_code, ErrorCode.UPSTREAM_RATE_LIMITED)
-        self.assertFalse(DataVersion.objects.exists())
+        KaipanlaSectorFundFlowSnapshot.objects.using('kaipanla').all().delete()
 
-    @patch('kaipanla.services.read_path.KaipanlaSectorFundFlowFetcher')
-    @patch('kaipanla.services.read_path.KaipanlaSectorFundFlowClient')
-    @patch('kaipanla.services.read_path.flow_client_settings')
-    def test_an_incomplete_payload_keeps_the_retryable_preparing_path(
-        self, flow_settings, client_class, fetcher_class
-    ):
-        """上游返回坏结构不该变成 503：换个时刻再来一次确实可能成功。"""
-        from kaipanla.services.client import KaipanlaSectorFundFlowClientSettings
-        from kaipanla.services.fetcher import KaipanlaSectorFundFlowFetchResult
-        from kaipanla.services.read_path import _repair_current_snapshot
+        with self.assertRaises(ApiError) as raised:
+            read_dates()
 
-        DataVersion.objects.all().delete()
-        flow_settings.return_value = KaipanlaSectorFundFlowClientSettings(
-            endpoint='https://example.invalid', device_id='device', user_id='', token='',
-            version='5.23.0.4', api_version='w44', phone_os_new='1', timeout_seconds=10,
-            controller='ZhiShuRanking', action='RealRankingInfo', order='1', ranking_type='1',
-            zs_type='4', page_size=80, request_delay_seconds=1.0,
-        )
-        fetcher_class.return_value.fetch.return_value = KaipanlaSectorFundFlowFetchResult(
-            rows=(), is_complete=False, expected_page_count=1, completed_page_count=0,
-            failed_page_offsets=(0,), source_timestamp=None, source_trade_date=None,
-            error_summary='A required page was empty or malformed.', failure_kind='payload',
-        )
-
-        with self.patch_now(2026, 9, 8, 14, 30):
-            outcome = _repair_current_snapshot(self.trade_date)
-
-        self.assertFalse(outcome.published)
-        self.assertIsNone(outcome.upstream_code)
-        self.assertFalse(DataVersion.objects.exists())
+        self.assertEqual(raised.exception.http_status, 404)

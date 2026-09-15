@@ -24,10 +24,16 @@ class StockMoveAnalysisItem:
 
 @dataclass(frozen=True)
 class StockMoveAnalysis:
+    """One day's six ranked groups, and nothing else.
+
+    The group counts, the distinct-stock count and the data-quality warnings are
+    all functions of these rows, so the read path derives them while serializing
+    a day (``read_path._serialize`` / ``read_path._warnings``). Computing them
+    here as well would be a second copy of the same arithmetic, and the two
+    could disagree — a stock could be counted on write and dropped on read.
+    """
+
     items: tuple[StockMoveAnalysisItem, ...]
-    group_counts: dict[str, int]
-    distinct_stock_count: int
-    warnings: tuple[str, ...]
 
 
 def build_stock_move_analysis(snapshot: CompleteMarketSnapshot) -> StockMoveAnalysis:
@@ -43,7 +49,6 @@ def build_stock_move_analysis(snapshot: CompleteMarketSnapshot) -> StockMoveAnal
     candidates: dict[str, list[StockMoveAnalysisItem]] = {
         choice: [] for choice in StockMoveItem.Group.values
     }
-    warnings: list[str] = []
 
     for price in snapshot.prices:
         if not _has_usable_price(price):
@@ -51,32 +56,24 @@ def build_stock_move_analysis(snapshot: CompleteMarketSnapshot) -> StockMoveAnal
         group = _group_for_price(price.exchange, price.change_percent, price.turnover)
         if group is None:
             continue
-
-        industries = industries_by_stock.get(price.stock_code, ())
-        if not price.stock_name:
-            warnings.append(f'股票 {price.stock_code} 名称缺失。')
-        if not industries:
-            warnings.append(f'股票 {price.stock_code} 未映射到开盘啦板块。')
         candidates[group].append(
             StockMoveAnalysisItem(
                 group=group,
                 rank=0,
                 stock_code=price.stock_code,
                 stock_name=price.stock_name,
-                industries=industries,
+                industries=industries_by_stock.get(price.stock_code, ()),
                 change_percent=price.change_percent,
                 turnover=price.turnover,
             )
         )
 
     items: list[StockMoveAnalysisItem] = []
-    group_counts: dict[str, int] = {}
     for group in StockMoveItem.Group.values:
         ranked = sorted(
             candidates[group],
             key=lambda item: _sort_key(group, item),
         )
-        group_counts[group] = len(ranked)
         items.extend(
             StockMoveAnalysisItem(
                 group=item.group,
@@ -90,12 +87,7 @@ def build_stock_move_analysis(snapshot: CompleteMarketSnapshot) -> StockMoveAnal
             for rank, item in enumerate(ranked, start=1)
         )
 
-    return StockMoveAnalysis(
-        items=tuple(items),
-        group_counts=group_counts,
-        distinct_stock_count=len({item.stock_code for item in items}),
-        warnings=tuple(dict.fromkeys(warnings)),
-    )
+    return StockMoveAnalysis(items=tuple(items))
 
 
 def _industries_by_stock(snapshot: CompleteMarketSnapshot):

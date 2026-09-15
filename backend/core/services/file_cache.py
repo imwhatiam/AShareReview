@@ -32,7 +32,7 @@ class FileCache:
     def path_for(self, key: CacheKey) -> Path:
         return self.directory / key.module_id / key.filename
 
-    def get(self, key: CacheKey, data_version: str, now: float | None = None) -> Any | None:
+    def get(self, key: CacheKey, cache_identity: str, now: float | None = None) -> Any | None:
         """Return the cached payload, or ``None`` for any kind of miss.
 
         A *corrupt* entry is still a miss — the caller recomputes it from SQLite
@@ -51,7 +51,7 @@ class FileCache:
             return None
         try:
             payload = json.loads(raw)
-            if payload['data_version'] != data_version:
+            if payload['cache_identity'] != cache_identity:
                 return None
             if payload['expires_at'] <= (time.time() if now is None else now):
                 return None
@@ -75,7 +75,7 @@ class FileCache:
         self,
         key: CacheKey,
         data: Any,
-        data_version: str,
+        cache_identity: str,
         now: float | None = None,
     ) -> None:
         """Write the payload's **JSON view** under ``key``, atomically.
@@ -98,7 +98,7 @@ class FileCache:
             {
                 'created_at': created_at,
                 'expires_at': created_at + self.ttl_seconds,
-                'data_version': data_version,
+                'cache_identity': cache_identity,
                 'data': data,
             },
             ensure_ascii=False,

@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 from django.core.management import call_command, get_commands, load_command_class
 from django.core.management.base import CommandError
-from django.test import SimpleTestCase, TestCase
+from django.test import SimpleTestCase
 
 from core.management.base import BaseDataCommand
 from core.services.locking import DatasetLocked
@@ -19,13 +19,10 @@ _DATA_COMMAND_NAMES = {
     'init_stock_daily_prices',
     'refresh_intraday_quotes',
     'sync_kaipanla_industry_snapshot',
-    'sync_stock_daily_prices',
     'sync_stock_master',
-    'sync_trading_calendar',
 }
 
-# 四个 --date 命令的必填值；其余参数都带默认值。填的是日期，命令的 type 也是
-# date.fromisoformat，所以能通过解析。
+# ``--date`` 的值。填的是日期，命令的 type 也是 date.fromisoformat，所以能通过解析。
 _DATA_COMMAND_DATE = '2026-09-08'
 
 
@@ -44,18 +41,22 @@ def _discover_data_commands() -> set[str]:
 
 
 def _required_arguments(command_name: str) -> tuple[str, ...]:
-    """补上命令的必填参数，让调用能走到"抢锁"那一步。
+    """补上参数，让调用能走到"抢锁"那一步。
 
     参数从命令自己的 parser 里问出来，同样不手写：手写清单正是上一条不变量漏掉
     ``refresh_intraday_quotes`` 的同一种病。这里用了 argparse 的私有 ``_actions``
     —— 它没有公开的枚举接口，而漏一个必填参数的表现是"用例假成功"，不值得为
     避免私有属性冒这个险。
+
+    ``--date`` 在三个 ``build_*`` 上已经可选，仍然显式传入：``SimpleTestCase``
+    禁止访问数据库，而"不传日期"会让命令去查库解析默认锚点，这条只关心锁顺序的
+    用例就会以 "Database access not allowed" 失败 —— 那与它要守的东西无关。
     """
     command = load_command_class(get_commands()[command_name], command_name)
     parser = command.create_parser('manage.py', command_name)
     arguments: list[str] = []
     for action in parser._actions:  # noqa: SLF001
-        if action.required:
+        if action.required or action.dest == 'date':
             arguments.extend(action.option_strings[:1])
             arguments.append(_DATA_COMMAND_DATE)
     return tuple(arguments)
@@ -127,35 +128,3 @@ class ManagementCommandContractTests(SimpleTestCase):
         self.assertIn('dry_run=True', rendered)
         self.assertIn('duration_seconds=', rendered)
         self.assertIn('batch_id=', rendered)
-
-
-class ManagementCommandRunStatusTests(TestCase):
-    def test_successful_command_clears_the_prior_consecutive_failure_count(self):
-        from core.integrations.hithink.contracts import HithinkTicker
-        from core.models import ModuleRunStatus
-
-        class SuccessfulHithinkClient:
-            def list_a_share_tickers(self, *, limit, offset):
-                if offset:
-                    return ()
-                return (HithinkTicker('000001.SZ', '000001', '平安银行', 'szse'),)
-
-        ModuleRunStatus.objects.create(
-            module_id='core',
-            dataset_key='stock_master',
-            status=ModuleRunStatus.Status.FAILED,
-            completeness='failed',
-            serving_stale=True,
-            consecutive_failure_count=3,
-            error_summary='old failure',
-        )
-
-        with patch(
-            'core.services.sync_reference.HithinkClient',
-            return_value=SuccessfulHithinkClient(),
-        ):
-            call_command('sync_stock_master', '--limit', '1')
-
-        status = ModuleRunStatus.objects.get(module_id='core', dataset_key='stock_master')
-        self.assertEqual(status.status, ModuleRunStatus.Status.SUCCESS)
-        self.assertEqual(status.consecutive_failure_count, 0)

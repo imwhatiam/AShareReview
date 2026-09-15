@@ -12,6 +12,11 @@ only ever serves rows whose version is in the set of complete publications.
 
 ``blank``/``default=''`` keeps the column addition non-null-safe, and the data
 migration below backfills the rows that already exist.
+
+That backfill is now a no-op on any database built from scratch: ``core/0006``
+deletes ``DataVersion``, and this migration's own ``0003`` drops the column
+again, so a fresh database has neither the source table to read nor a column
+left to write. The guard below keeps the migration runnable in that order.
 """
 
 from django.db import migrations, models
@@ -33,7 +38,12 @@ def backfill_source_data_version(apps, schema_editor):
     command.
     """
     Snapshot = apps.get_model('kaipanla', 'KaipanlaSectorFundFlowSnapshot')
-    DataVersion = apps.get_model('core', 'DataVersion')
+    try:
+        DataVersion = apps.get_model('core', 'DataVersion')
+    except LookupError:
+        # 只可能发生在全新数据库上：core 的迁移已经先跑完，把这个模型删掉了。
+        # 那条链上这一列随后也会被 0003 删掉，回填本来就是白写。
+        return
     alias = schema_editor.connection.alias
 
     trade_dates = (

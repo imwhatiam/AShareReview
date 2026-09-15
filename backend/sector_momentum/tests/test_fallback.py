@@ -4,22 +4,21 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from django.test import TestCase
+from django.utils import timezone
 
 from core.api.errors import ApiError, ErrorCode
-from core.models import DataVersion
+from core.models import IndustrySnapshot
 from core.services.cache_keys import build_cache_key
 from core.services.contracts import (
     CompleteMarketSnapshot,
-    MarketDataVersion,
     MarketPrice,
     Industry,
 )
 from core.services.file_cache import FileCache
 from core.services.locking import DatasetLocked
 from core.services.market_data import CompleteMarketDataUnavailable
-from sector_momentum.models import SectorMomentumRanking, SectorMomentumResult
+from sector_momentum.models import SectorMomentumRanking
 from sector_momentum.services.read_path import read_sector_momentum
-from sector_momentum.services.source_versions import CompleteIndustrySnapshotUnavailable
 
 
 class SectorMomentumFallbackTests(TestCase):
@@ -28,24 +27,19 @@ class SectorMomentumFallbackTests(TestCase):
     def setUp(self):
         self.trade_date = date(2026, 9, 8)
         self.next_trade_date = date(2026, 9, 9)
-        self.result = SectorMomentumResult.objects.using('sector_momentum').create(
-            business_date=self.trade_date,
-            source_daily_price_version='daily-prices-v1',
-            source_industry_version='industries-v1',
-            total_market_turnover=Decimal('100'),
+        # 行业映射是排行的分组键，本地生成前会先确认它在库里。
+        IndustrySnapshot.objects.create(
+            industry_code='I1', industry_name='行业甲', stock_codes=['600001']
         )
-        SectorMomentumRanking.objects.using('sector_momentum').create(
-            result=self.result,
+        self.published_at = timezone.now()
+        self.ranking = SectorMomentumRanking.objects.using('sector_momentum').create(
+            business_date=self.trade_date,
             metric=SectorMomentumRanking.Metric.ABOVE_5PCT,
-            rank=1,
             industry_code='I1',
             industry_name='行业甲',
-            stock_count=1,
-            average_change_percent=Decimal('8'),
-            industry_turnover=Decimal('100'),
-            market_turnover_ratio=Decimal('1'),
-            score=Decimal('8'),
             stocks=[],
+            total_market_turnover=Decimal('100'),
+            published_at=self.published_at,
         )
         self.cache_directory = TemporaryDirectory()
         self.cache = FileCache(self.cache_directory.name, ttl_seconds=300, max_bytes=1_000_000)
@@ -58,10 +52,10 @@ class SectorMomentumFallbackTests(TestCase):
         cache_patch.start()
         self.addCleanup(cache_patch.stop)
 
-    def _snapshot(self, count=1, version='daily-prices-v2', trade_date=None):
+    def _snapshot(self, count=1, trade_date=None, industries=None):
         day = trade_date or self.trade_date
         return CompleteMarketSnapshot(
-            data_version=MarketDataVersion(version=version, business_date=day),
+            business_date=day,
             prices=tuple(
                 MarketPrice(
                     stock_code=f'600{number:03d}', thscode=f'600{number:03d}.SH',
@@ -72,24 +66,18 @@ class SectorMomentumFallbackTests(TestCase):
                 )
                 for number in range(1, count + 1)
             ),
-            industries=(Industry('I1', '行业甲', ('600001',)),),
-        )
-
-    def _complete_version(self, dataset_key, version, business_date=None):
-        return DataVersion.objects.create(
-            dataset_key=dataset_key,
-            version=version,
-            business_date=business_date or self.trade_date,
-            status=DataVersion.Status.COMPLETE,
-            expected_record_count=1,
-            actual_record_count=1,
+            industries=(
+                (Industry('I1', '行业甲', ('600001',)),) if industries is None else industries
+            ),
         )
 
     @patch('sector_momentum.services.read_path.default_file_cache')
     def test_corrupted_cache_falls_back_to_database_data(self, cache_factory):
         cache_factory.return_value = self.cache
+        # 缓存身份 = 所服务那一行的发布时间，不是版本号。
         key = build_cache_key(
-            'sector_momentum', 'result', {'date': '2026-09-08'}, 'daily-prices-v1:industries-v1'
+            'sector_momentum', 'result', {'date': '2026-09-08'},
+            self.ranking.published_at.isoformat(),
         )
         path = self.cache.path_for(key)
         path.parent.mkdir(parents=True)
@@ -100,32 +88,68 @@ class SectorMomentumFallbackTests(TestCase):
         self.assertEqual(result.source, 'database')
         self.assertEqual(result.data['rankings']['above_5pct'][0]['industry_code'], 'I1')
 
-    @patch('sector_momentum.services.read_path.get_complete_industry_snapshot_version')
     @patch('sector_momentum.services.read_path.get_complete_market_snapshot')
-    def test_missing_result_is_generated_from_local_public_snapshot(self, snapshot, industry):
+    def test_missing_result_is_generated_from_local_public_snapshot(self, snapshot):
         SectorMomentumRanking.objects.using('sector_momentum').all().delete()
-        SectorMomentumResult.objects.using('sector_momentum').all().delete()
         snapshot.return_value = self._snapshot()
-        industry.return_value = 'industries-v2'
 
         result = read_sector_momentum(self.trade_date)
 
         self.assertEqual(result.source, 'computed')
         self.assertFalse(result.stale)
-        self.assertEqual(result.data_version, 'daily-prices-v2:industries-v2')
-        self.assertTrue(SectorMomentumResult.objects.using('sector_momentum').filter(
-            source_daily_price_version='daily-prices-v2',
-            source_industry_version='industries-v2',
-        ).exists())
+        self.assertEqual(
+            SectorMomentumRanking.objects.using('sector_momentum')
+            .filter(business_date=self.trade_date).count(),
+            2,
+            '两个口径各一行',
+        )
 
-    @patch('sector_momentum.services.read_path.get_complete_industry_snapshot_version')
     @patch('sector_momentum.services.read_path.get_complete_market_snapshot')
-    def test_large_snapshot_is_generated_without_a_row_budget(self, snapshot, industry):
+    def test_missing_industry_mapping_makes_the_day_unavailable(self, snapshot):
+        """没有行业映射就没有板块：宁可"不可用"，也不落一份空排行。"""
+        SectorMomentumRanking.objects.using('sector_momentum').all().delete()
+        IndustrySnapshot.objects.all().delete()
+        snapshot.return_value = self._snapshot()
+
+        with self.assertRaises(CompleteMarketDataUnavailable):
+            read_sector_momentum(self.trade_date)
+
+        self.assertFalse(SectorMomentumRanking.objects.using('sector_momentum').exists())
+
+    @patch('sector_momentum.services.read_path.get_complete_market_snapshot')
+    def test_a_day_with_no_qualifying_industry_renders_an_empty_ranking(self, snapshot):
+        """一天没有任何行业入选时表里没有行，但这一天仍然要能读出全市场成交额。
+
+        行业分组来自公共快照本身，`IndustrySnapshot` 只被 `require_industry_snapshot()`
+        用来确认"行业映射在库里"（存在性检查），改它的行内容并不能让行业消失 ——
+        要让这一天没有行业，必须让快照里就没有行业。
+        """
+        SectorMomentumRanking.objects.using('sector_momentum').all().delete()
+        snapshot.return_value = self._snapshot(industries=())
+
+        result = read_sector_momentum(self.trade_date)
+
+        self.assertEqual(result.source, 'computed')
+        self.assertEqual(result.data['rankings']['above_5pct'], [])
+        self.assertEqual(result.data['rankings']['top_5_percent'], [])
+        self.assertEqual(result.data['unmapped_stock_count'], 1)
+        self.assertFalse(SectorMomentumRanking.objects.using('sector_momentum').exists())
+
+    @patch('sector_momentum.services.read_path.get_complete_market_snapshot')
+    def test_a_stored_result_is_served_without_regenerating_it(self, snapshot):
+        """结果按业务日期唯一，读路径不做任何"是否过期"的比较。"""
+        snapshot.side_effect = AssertionError('a stored result must not be regenerated')
+
+        result = read_sector_momentum(self.trade_date)
+
+        self.assertEqual(result.source, 'database')
+        self.assertFalse(result.stale)
+
+    @patch('sector_momentum.services.read_path.get_complete_market_snapshot')
+    def test_large_snapshot_is_generated_without_a_row_budget(self, snapshot):
         """The local generation path is a computation, not a bounded remote repair."""
         SectorMomentumRanking.objects.using('sector_momentum').all().delete()
-        SectorMomentumResult.objects.using('sector_momentum').all().delete()
         snapshot.return_value = self._snapshot(count=2500)
-        industry.return_value = 'industries-v2'
 
         result = read_sector_momentum(self.trade_date)
 
@@ -140,37 +164,37 @@ class SectorMomentumFallbackTests(TestCase):
         with self.assertRaises(CompleteMarketDataUnavailable):
             read_sector_momentum(self.next_trade_date)
 
-    @patch('core.services.sync_daily_prices.sync_stock_daily_prices')
+    @patch('core.services.sync_daily_prices.HithinkClient')
     @patch('sector_momentum.services.read_path.get_complete_market_snapshot')
-    def test_absent_public_data_never_starts_remote_full_market_sync(self, snapshot, sync):
+    def test_absent_public_data_never_starts_an_upstream_fetch(self, snapshot, client):
+        """读路径要么用已存的数据回答，要么不回答 —— 绝不自己去抓。
+
+        锚点钉在上游客户端而不是某个命令的服务函数上：这个数据集的每一次抓取都要
+        过 ``HithinkClient``，所以换了入口（例如历史同步命令被删掉、只剩盘中刷新）
+        这条不变量依然守着，新加的命令也绕不过去。
+        """
         SectorMomentumRanking.objects.using('sector_momentum').all().delete()
-        SectorMomentumResult.objects.using('sector_momentum').all().delete()
         snapshot.side_effect = CompleteMarketDataUnavailable('no complete public data')
 
         with self.assertRaises(CompleteMarketDataUnavailable):
             read_sector_momentum(self.trade_date)
 
-        sync.assert_not_called()
+        client.assert_not_called()
 
-    @patch('sector_momentum.services.read_path.get_complete_industry_snapshot_version')
     @patch('sector_momentum.services.read_path.latest_complete_stock_price_date')
     @patch('sector_momentum.services.read_path.get_complete_market_snapshot')
     def test_default_entry_follows_the_newest_public_date_and_generates_it(
-        self, snapshot, latest_public, industry
+        self, snapshot, latest_public
     ):
         SectorMomentumRanking.objects.using('sector_momentum').all().delete()
-        SectorMomentumResult.objects.using('sector_momentum').all().delete()
         latest_public.return_value = self.next_trade_date
-        snapshot.return_value = self._snapshot(
-            version='daily-prices-20260909-v1', trade_date=self.next_trade_date
-        )
-        industry.return_value = 'industries-v2'
+        snapshot.return_value = self._snapshot(trade_date=self.next_trade_date)
 
         result = read_sector_momentum()
 
         self.assertEqual(result.business_date, self.next_trade_date)
         self.assertEqual(result.source, 'computed')
-        self.assertEqual(result.data_version, 'daily-prices-20260909-v1:industries-v2')
+        self.assertEqual(result.data['trade_date'], '2026-09-09')
 
     @patch('sector_momentum.services.read_path.latest_complete_stock_price_date')
     @patch('sector_momentum.services.read_path.get_complete_market_snapshot')
@@ -186,24 +210,8 @@ class SectorMomentumFallbackTests(TestCase):
         self.assertTrue(result.stale)
         self.assertEqual(result.source, 'database')
         self.assertIn(
-            '公共行情或开盘啦行业映射已更新，正在展示最近可用的分析结果。', result.warnings
+            '正在展示最近可用的分析结果，当日结果可能尚未生成。', result.warnings
         )
-
-    @patch('sector_momentum.services.read_path.get_complete_industry_snapshot_version')
-    @patch('sector_momentum.services.read_path.get_complete_market_snapshot')
-    def test_absent_industry_snapshot_keeps_the_stale_result_instead_of_failing(
-        self, snapshot, industry
-    ):
-        self._complete_version('stock_daily_prices', 'daily-prices-v2')
-        snapshot.return_value = self._snapshot()
-        industry.side_effect = CompleteIndustrySnapshotUnavailable('no industry snapshot')
-
-        result = read_sector_momentum(self.trade_date)
-
-        self.assertEqual(result.business_date, self.trade_date)
-        self.assertEqual(result.source, 'database')
-        self.assertTrue(result.stale)
-        self.assertEqual(result.data_version, 'daily-prices-v1:industries-v1')
 
     @patch('sector_momentum.services.read_path.latest_complete_stock_price_date')
     @patch('sector_momentum.services.read_path.dataset_lock')
@@ -228,7 +236,6 @@ class SectorMomentumFallbackTests(TestCase):
         它的语义，四个业务模块现在给出同一个答案。
         """
         SectorMomentumRanking.objects.using('sector_momentum').all().delete()
-        SectorMomentumResult.objects.using('sector_momentum').all().delete()
         latest_public.return_value = self.next_trade_date
         lock.side_effect = DatasetLocked('sector_momentum:sector_momentum is already running.')
 
@@ -249,19 +256,3 @@ class SectorMomentumFallbackTests(TestCase):
 
         self.assertEqual(caught.exception.http_status, 409)
         self.assertEqual(caught.exception.code, ErrorCode.SYNC_IN_PROGRESS)
-
-    @patch('sector_momentum.services.read_path.get_complete_industry_snapshot_version')
-    @patch('sector_momentum.services.read_path.get_complete_market_snapshot')
-    def test_stale_result_is_regenerated_when_daily_or_industry_version_changes(
-        self, snapshot, industry
-    ):
-        self._complete_version('stock_daily_prices', 'daily-prices-v2')
-        self._complete_version('industry_snapshot', 'industries-v2')
-        snapshot.return_value = self._snapshot()
-        industry.return_value = 'industries-v2'
-
-        result = read_sector_momentum(self.trade_date)
-
-        self.assertEqual(result.source, 'computed')
-        self.assertFalse(result.stale)
-        self.assertEqual(result.data_version, 'daily-prices-v2:industries-v2')

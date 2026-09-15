@@ -181,19 +181,24 @@ class KaipanlaSectorFundFlowFetcherTests(SimpleTestCase):
         self.assertEqual(fetcher.max_pages, 7)
 
     def test_explicit_keywords_still_win_over_the_configured_defaults(self):
-        """显式传参必须压过配置：板块资金流的一次现场修复靠它做到"单页、0 重试"。"""
+        """显式传参必须压过配置：单次受控采集（例如 0 重试 + 有限页数）靠它做到。"""
         from kaipanla.services.fetcher import KaipanlaSectorFundFlowFetcher
 
-        fetcher = KaipanlaSectorFundFlowFetcher(
-            client=Mock(),
-            page_size=80,
-            max_pages=1,
-            max_retries=0,
-            retry_delay_seconds=0.0,
-        )
+        with patch.dict(
+            'os.environ',
+            {'KAIPANLA_MAX_RETRIES': '3', 'KAIPANLA_FLOW_MAX_PAGES': '20'},
+            clear=False,
+        ):
+            fetcher = KaipanlaSectorFundFlowFetcher(
+                client=Mock(),
+                page_size=80,
+                max_pages=3,
+                max_retries=0,
+                retry_delay_seconds=0.0,
+            )
 
         self.assertEqual(fetcher.page_size, 80)
-        self.assertEqual(fetcher.max_pages, 1)
+        self.assertEqual(fetcher.max_pages, 3)
         self.assertEqual(fetcher.max_retries, 0)
         self.assertEqual(fetcher.retry_delay_seconds, 0.0)
 
@@ -280,3 +285,76 @@ class KaipanlaSectorFundFlowFetcherTests(SimpleTestCase):
         transport.post.return_value.text = '{invalid'
         with self.assertRaises(KaipanlaPayloadError):
             client.fetch_page(80)
+
+
+class KaipanlaClientUpstreamErrorCodeTests(SimpleTestCase):
+    """资金流链路的失败必须能在日志里被认出来。
+
+    2026-09-15 之前，``kaipanla/services/client.py`` 与
+    ``core/integrations/kaipanla/client.py`` 各自声明了**同名但不同对象**的
+    ``KaipanlaUnavailableError`` / ``KaipanlaRateLimitError``，而
+    ``core.api.errors.upstream_error_code`` 只 isinstance 后者那一套。于是资金流
+    链路无论是被 429 限流还是上游直接挂掉，``data_command_failed`` /
+    ``upstream_failed`` 里的 ``error_code`` **恒为空**，运维分不出这两种情况。
+    现在两处共用 ``core.integrations.kaipanla.contracts`` 里的一套名字。
+    """
+
+    def _settings(self, **overrides):
+        from kaipanla.services.client import KaipanlaSectorFundFlowClientSettings
+
+        values = {
+            'endpoint': 'https://example.invalid',
+            'device_id': '', 'user_id': '', 'token': '',
+            'version': '5.23.0.4', 'api_version': 'w44', 'phone_os_new': '1',
+            'timeout_seconds': 1,
+            'controller': 'ZhiShuRanking', 'action': 'RealRankingInfo',
+            'order': '1', 'ranking_type': '1', 'zs_type': '4',
+        }
+        values.update(overrides)
+        return KaipanlaSectorFundFlowClientSettings(**values)
+
+    def test_the_two_adapters_share_one_set_of_exception_classes(self):
+        from core.integrations.kaipanla import client as industry_client
+        from kaipanla.services import client as flow_client
+
+        self.assertIs(flow_client.KaipanlaUnavailableError, industry_client.KaipanlaUnavailableError)
+        self.assertIs(flow_client.KaipanlaRateLimitError, industry_client.KaipanlaRateLimitError)
+        self.assertIs(flow_client.KaipanlaPayloadError, industry_client.KaipanlaPayloadError)
+
+    def test_flow_failures_map_to_the_same_error_codes_as_industry_failures(self):
+        from core.api.errors import upstream_error_code_value
+        from kaipanla.services.client import KaipanlaRateLimitError, KaipanlaPayloadError, KaipanlaUnavailableError
+
+        self.assertEqual(upstream_error_code_value(KaipanlaRateLimitError('x')), 'UPSTREAM_RATE_LIMITED')
+        self.assertEqual(upstream_error_code_value(KaipanlaUnavailableError('x')), 'UPSTREAM_UNAVAILABLE')
+        # payload/契约错误不是传输失败，故意留空而不是错标成"上游挂了"。
+        self.assertIsNone(upstream_error_code_value(KaipanlaPayloadError('x')))
+
+    def test_throttling_and_transport_failures_log_distinct_error_codes(self):
+        import requests
+
+        from core.integrations.kaipanla.contracts import KaipanlaRateLimitError, KaipanlaUnavailableError
+        from kaipanla.services.client import KaipanlaSectorFundFlowClient
+
+        class Response:
+            status_code = 429
+            text = ''
+
+        transport = Mock()
+        transport.post.return_value = Response()
+
+        with patch('kaipanla.services.client.log_event') as log_event:
+            with self.assertRaises(KaipanlaRateLimitError):
+                KaipanlaSectorFundFlowClient(settings=self._settings(), transport=transport).fetch_page(0)
+
+        self.assertEqual(log_event.call_args.kwargs['error_code'], 'UPSTREAM_RATE_LIMITED')
+        self.assertEqual(log_event.call_args.kwargs['status'], 429)
+
+        transport.post.side_effect = requests.ConnectionError('boom')
+        with patch('kaipanla.services.client.log_event') as log_event:
+            with self.assertRaises(KaipanlaUnavailableError) as caught:
+                KaipanlaSectorFundFlowClient(settings=self._settings(), transport=transport).fetch_page(0)
+
+        self.assertEqual(log_event.call_args.kwargs['error_code'], 'UPSTREAM_UNAVAILABLE')
+        # 网络那一支不再把 error_code 写死：它现在同样由异常类型推出来。
+        self.assertNotIsInstance(caught.exception, KaipanlaRateLimitError)

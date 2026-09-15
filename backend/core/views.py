@@ -12,6 +12,7 @@ from core.api.responses import api_success
 from core.logging import log_event
 from core.module_registry import get_enabled_modules
 from core.services import login_throttle
+from core.services.calendar import calendar_coverage
 
 # 独立的 core.auth 名字：鉴权事件是安全审计要单独筛的一类，混在 core.views 里
 # 就得靠消息文本区分。只记录「谁在什么时候失败了」，绝不记录密码或凭据原文。
@@ -42,7 +43,6 @@ def _session_response(request):
     return api_success(
         data=_session_data(request),
         business_date=None,
-        data_version=None,
         source='application',
     )
 
@@ -129,10 +129,15 @@ def logout(request):
 
 @require_GET
 def health(request):
+    # 存活检查本身不碰上游，但交易日口径的"依赖还剩多少覆盖"必须在这里可见：
+    # chinese-calendar 的假期表按年内置，未覆盖年份会静默退化成"工作日即交易日"，
+    # 而唯一的安全兜底（上游日历）已经删除。等到第一次请求被上游拒绝才发现就太晚了。
     return api_success(
-        data={'healthy': True},
+        data={
+            'healthy': True,
+            'trading_calendar': calendar_coverage(),
+        },
         business_date=None,
-        data_version=None,
         source='application',
     )
 
@@ -142,7 +147,6 @@ def modules(request):
     return api_success(
         data=[module.as_api_dict() for module in get_enabled_modules()],
         business_date=None,
-        data_version=None,
         source='application',
     )
 

@@ -2,18 +2,13 @@ import { fireEvent, render, screen, within } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 
 import { pickDate } from '../../test/datePicker'
+import { envelope } from '../../test/envelope'
+import { expectRefreshRefetches } from '../../test/refreshStamp'
 import HundredDayPage from './HundredDayPage'
 
 vi.mock('./RatioTrendChart', () => ({
   default: ({ trend }) => <div>占比趋势：{trend.map((point) => point.trade_date).join('、')}</div>,
 }))
-
-function envelope(data, overrides = {}) {
-  return {
-    status: 'ok', business_date: '2026-09-09', data_version: 'hundred-day:1',
-    stale: false, warnings: [], data, ...overrides,
-  }
-}
 
 const result = {
   trade_date: '2026-09-09',
@@ -173,7 +168,7 @@ describe('HundredDayPage', () => {
   })
 
   /*
-   * 日期控件在任何数据状态下都必须保持挂载：`usePolledResource` 在 path 变化时
+   * 日期控件在任何数据状态下都必须保持挂载：`useResource` 在 path 变化时
    * 会把 phase 打回 loading，若页面据此整页替换，用户刚在弹层里点完一天，控件就被
    * 卸载重建 —— 弹层、焦点、滚动位置全丢，页面还会先塌成一行提示再弹回来。
    */
@@ -211,4 +206,7 @@ describe('HundredDayPage', () => {
     // 三个汇总指标依赖 totals，缺失时整组不渲染（排行条目里的"有效股票"不在工具栏内）。
     expect(dateTrigger.closest('.toolbar').querySelectorAll('.stat-row')).toHaveLength(0)
   })
+
+  it('re-requests the same day when「更新于」is clicked', () =>
+    expectRefreshRefetches(HundredDayPage, { payload: result, endpoint: '/api/hundred-day/' }))
 })

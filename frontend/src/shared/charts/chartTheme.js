@@ -1,60 +1,26 @@
 /*
- * 图表视觉基线：不 import echarts，只产出普通对象。
- * 四个业务图共用同一套网格、坐标、提示与配色，保证观感一致。
+ * 两个盘后模块的业务图 option 构造器：
+ *   - `momentumOption` —— 板块动量的竖排分组柱（`sector-momentum/MomentumChart.jsx`）；
+ *   - `trendOption`    —— 百日新高的镜像柱（`hundred-day/RatioTrendChart.jsx`）。
  *
- * **这是图表配色的唯一定义处**：图表在 canvas 上渲染，读不到 CSS 变量，所以
- * `src/styles/tokens.css` 里不再放 `--chart-*`。`up` / `down` / `score` 与
- * tokens.css 的 `--color-market-up` / `--color-market-down` / `--color-brand-500`
- * 取值相同，**改任一侧都要手工同步另一侧**（没有构建期校验）。
+ * 资金流那两张图的构造器在 `features/sector-flow/flowOption.js`（它只服务那一个
+ * 模块，所以不住在共享层），同样是下列基线的消费者。
  *
- * 数字写法不在这里自己写一份：金额/百分比全部取自 `shared/stockFormat`。本文件
- * 会被裸 Node 直接 import，所以那个 specifier **必须带 `.js` 后缀**
- * —— Node 的 ESM 解析器不做后缀推断。
+ * 配色、提示、网格、入场动画与两根坐标轴全部取自 `chartBaseline.js` —— 那是
+ * **四图共用基线的唯一定义处**，本文件不自己写一份颜色或网格。
  *
- * **只导出四个业务图实际消费的 5 个符号**（`momentumOption` / `trendOption` /
- * `flowOption` / `scoreAxisMax` / `MOMENTUM_BARS`）；`CHART`、`TOOLTIP`、`GRID`、
- * `LEGEND` 与各 axis / series 工厂刻意留在模块内 —— 它们只在拼一个完整 option 时
- * 才有意义，放出去只会让人拼出偏离基线的图。
+ * **只导出这两个模块实际消费的 4 个符号**（`momentumOption` / `trendOption` /
+ * `scoreAxisMax` / `MOMENTUM_BARS`）；`LEGEND` 与 `momentumBarAxis` 刻意留在模块内
+ * —— 它们只在拼一个完整 option 时才有意义，放出去只会让人拼出偏离基线的图。
  */
-import { formatFlowAmount } from '../stockFormat.js'
-
-/*
- * 四个业务图共用的入场动画时长。写成常量而不是散落三处 `320`：切换日期时四张图
- * 的入场节奏必须一致，改一处漏两处就会看出快慢差异。
- */
-const ANIMATION_DURATION_MS = 320
-
-const CHART = {
-  up: '#cf2c2d',
-  down: '#0d8f57',
-  score: '#3760e6',
-  neutral: '#5c6b85',
-  grid: '#eceff6',
-  axis: '#d8dfea',
-  label: '#5c6b85',
-}
-
-const TOOLTIP = {
-  trigger: 'axis',
-  backgroundColor: '#ffffff',
-  borderColor: '#e2e7f0',
-  borderWidth: 1,
-  padding: [10, 12],
-  textStyle: { color: '#1a2438', fontSize: 12 },
-  extraCssText: 'box-shadow: 0 8px 24px rgba(16, 24, 40, 0.12); border-radius: 10px;',
-  axisPointer: {
-    type: 'line',
-    lineStyle: { color: '#cdd6e5', type: 'dashed', width: 1 },
-  },
-}
-
-const GRID = {
-  left: 10,
-  right: 20,
-  top: 56,
-  bottom: 6,
-  containLabel: true,
-}
+import {
+  ANIMATION_DURATION_MS,
+  CHART,
+  GRID,
+  TOOLTIP,
+  categoryAxis,
+  valueAxis,
+} from './chartBaseline.js'
 
 const LEGEND = {
   type: 'scroll',
@@ -64,134 +30,6 @@ const LEGEND = {
   itemHeight: 10,
   itemGap: 14,
   textStyle: { color: CHART.neutral, fontSize: 11 },
-}
-
-/*
- * 类目轴刻度压缩：'2026-09-10 15:00' → '09-10'。
- * 只影响坐标轴上的显示文本，option.xAxis.data 始终保留原始值。
- */
-function shortCategoryLabel(value) {
-  const text = String(value)
-  const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(text)
-  return match ? `${match[2]}-${match[3]}` : text
-}
-
-function categoryAxis(data) {
-  return {
-    type: 'category',
-    boundaryGap: false,
-    data,
-    axisLine: { lineStyle: { color: CHART.axis } },
-    axisTick: { show: false },
-    axisLabel: {
-      color: CHART.label,
-      fontSize: 11,
-      hideOverlap: true,
-      formatter: shortCategoryLabel,
-    },
-  }
-}
-
-/*
- * 分时轴刻度：只保留"分钟数为 10 的整数倍"的时刻（09:30 / 09:40 / … / 11:30 /
- * 13:00 / … / 15:00）。不能按索引等间隔抽稀 —— 上午 09:30–11:30 共 25 个 5 分钟槽，
- * 索引步长会跨过午休错位一格，导致下午首个刻度变成 13:05、末刻度变成 14:55。
- * 按真实时刻判断则两个交易时段都对齐到整十分钟。
- */
-function isClockTick(value) {
-  const match = /^(\d{2}):(\d{2})$/.exec(String(value))
-  if (!match) return true
-  return Number(match[2]) % 10 === 0
-}
-
-function clockCategoryAxis(data) {
-  return {
-    type: 'category',
-    boundaryGap: false,
-    data,
-    axisLine: { lineStyle: { color: CHART.axis } },
-    axisTick: { show: false },
-    axisLabel: {
-      color: CHART.label,
-      fontSize: 11,
-      /* 刻度由 isClockTick 精确控制，不再交给 ECharts 的防重叠抽稀，
-         否则午休两侧相邻的 11:30 与 13:00 可能被误判为重叠而丢掉 13:00。 */
-      hideOverlap: false,
-      interval: (index, value) => isClockTick(value),
-    },
-  }
-}
-
-function valueAxis(name) {
-  return {
-    type: 'value',
-    name,
-    nameTextStyle: { color: CHART.label, fontSize: 11, align: 'left' },
-    nameGap: 18,
-    axisLine: { show: false },
-    axisTick: { show: false },
-    splitLine: { lineStyle: { color: CHART.grid, type: 'dashed' } },
-    axisLabel: { color: CHART.label, fontSize: 11 },
-  }
-}
-
-/* 按资金方向着色的折线：红为净流入，绿为净流出。 */
-function flowLineSeries(series, { showSymbol = true } = {}) {
-  return series.map((item) => {
-    const value = Number(item.latest_net_inflow)
-    const color = value >= 0 ? CHART.up : CHART.down
-    return {
-      name: item.name,
-      type: 'line',
-      smooth: 0.2,
-      showSymbol,
-      symbol: 'circle',
-      symbolSize: showSymbol ? 5 : 4,
-      connectNulls: false,
-      emphasis: { focus: 'series', scale: 1.4 },
-      lineStyle: { color, width: 2 },
-      itemStyle: { color },
-      data: item.data,
-      /* 取消顶部图例后，板块名与资金净额常驻在每条折线的右端。 */
-      endLabel: {
-        show: true,
-        distance: 6,
-        fontSize: 11,
-        fontWeight: 600,
-        color,
-        formatter: ({ value: lastValue, seriesName }) => {
-          const amount = formatFlowAmount(lastValue)
-          return amount ? `${seriesName} ${amount}` : seriesName
-        },
-      },
-      /* 多条折线在右端收敛时把标签上下错开，避免互相压住。 */
-      labelLayout: { moveOverlap: 'shiftY' },
-    }
-  })
-}
-
-/*
- * 线端常驻标签需要预留的横向空间，单位 px。
- * 标签画在 grid 右边界之外，可用宽度 = END_LABEL_GUTTER - endLabel.distance(6)，
- * 不够就会被画布裁掉，等于丢掉板块名。按布局库里的真实板块名实测（600 11px 无衬线）：
- * 「宁夏回族自治区 +12.3亿」118.9px，把金额换成三位数亿级约 125px；
- * 目前最长板块名为 7 个汉字（广西壮族自治区 / 宁夏回族自治区），
- * 取 152 可覆盖「7~8 个汉字 + 三位数亿级」的最坏组合。
- */
-const END_LABEL_GUTTER = 152
-
-export function flowOption({ timePoints, series, yAxisName, showSymbol, timeAxis = false }) {
-  return {
-    color: [CHART.up, CHART.down],
-    animationDuration: ANIMATION_DURATION_MS,
-    tooltip: { ...TOOLTIP, axisPointer: { ...TOOLTIP.axisPointer } },
-    /* 板块标识改为折线右端的 endLabel，顶部不再渲染图例。
-       top 只需给 y 轴名称（nameGap 18 + 字号 11）留出空间。 */
-    grid: { ...GRID, top: 36, right: END_LABEL_GUTTER },
-    xAxis: timeAxis ? clockCategoryAxis(timePoints) : categoryAxis(timePoints),
-    yAxis: valueAxis(yAxisName),
-    series: flowLineSeries(series, { showSymbol }),
-  }
 }
 
 /*

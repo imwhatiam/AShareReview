@@ -103,6 +103,35 @@ def get_int_setting(name: str, default: int) -> int:
         ) from error
 
 
+def get_required_int_setting(name: str, *, minimum: int = 0) -> int:
+    """Read a required integer setting, rejecting anything below ``minimum``.
+
+    Unlike :func:`get_int_setting` there is no default: a missing or malformed
+    value is a configuration error, not a silently substituted fallback. The
+    upstream adapters used to carry three byte-identical private copies of this.
+    """
+    value = get_required_setting(name)
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise ImproperlyConfigured(f'{name} must be an integer.') from error
+    if parsed < minimum:
+        raise ImproperlyConfigured(f'{name} must be at least {minimum}.')
+    return parsed
+
+
+def get_required_float_setting(name: str, *, minimum: float = 0.0) -> float:
+    """Read a required float setting, rejecting anything below ``minimum``."""
+    value = get_required_setting(name)
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise ImproperlyConfigured(f'{name} must be numeric.') from error
+    if parsed < minimum:
+        raise ImproperlyConfigured(f'{name} must be at least {minimum}.')
+    return parsed
+
+
 def get_list_setting(name: str, default: tuple[str, ...] = ()) -> list[str]:
     """Read a comma-separated setting, falling back to ``default`` when unset.
 

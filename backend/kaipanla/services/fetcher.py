@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass
 from math import ceil
 
-from backend.env import get_required_setting
+from backend.env import get_required_int_setting
 from core.logging import ProgressReporter, log_event
 from kaipanla.services.client import (
     KaipanlaPayloadError,
@@ -32,10 +32,10 @@ class KaipanlaSectorFundFlowFetchResult:
     error_summary: str = ''
     # ``error_summary`` 是给人看的句子，机器需要的是"为什么没拿到页"：
     # 'rate_limited' / 'unavailable' / 'payload' 之一，或 None（与上游无关的失败，
-    # 例如页数超预算、页内容为空）。读路径用它把失败映射成稳定错误码。
+    # 例如页数超预算、页内容为空）。日志按它把失败归类。
     failure_kind: str | None = None
     # 上游 ``Count`` 声称的总行数。``len(rows)`` 是**去重后能用的行数**，两者之差
-    # 就是"丢了什么"，写进采集运行的 missing_record_count（以前那里恒为 0）。
+    # 就是"丢了什么"，采集失败时由命令写进日志。
     upstream_record_count: int | None = None
     # 上游给到了行、但解析不出来的条数。以前这些行被静默跳过，快照照样标 complete，
     # 板块可以一整批消失而无人知晓；现在它是个可读的数字。
@@ -53,24 +53,6 @@ def _failure_kind(error: Exception | None) -> str | None:
     if isinstance(error, KaipanlaPayloadError):
         return 'payload'
     return None
-
-
-def _non_negative_integer(name: str) -> int:
-    value = get_required_setting(name)
-    try:
-        parsed = int(value)
-    except ValueError as error:
-        raise ValueError(f'{name} must be an integer.') from error
-    if parsed < 0:
-        raise ValueError(f'{name} must not be negative.')
-    return parsed
-
-
-def _positive_integer(name: str) -> int:
-    value = _non_negative_integer(name)
-    if value == 0:
-        raise ValueError(f'{name} must be positive.')
-    return value
 
 
 @dataclass(frozen=True)
@@ -102,9 +84,9 @@ def fetch_settings(client_settings=None) -> KaipanlaSectorFundFlowFetchSettings:
     client_settings = flow_client_settings() if client_settings is None else client_settings
     return KaipanlaSectorFundFlowFetchSettings(
         page_size=client_settings.page_size,
-        max_retries=_non_negative_integer('KAIPANLA_MAX_RETRIES'),
+        max_retries=get_required_int_setting('KAIPANLA_MAX_RETRIES'),
         retry_delay_seconds=client_settings.request_delay_seconds,
-        max_pages=_positive_integer('KAIPANLA_FLOW_MAX_PAGES'),
+        max_pages=get_required_int_setting('KAIPANLA_FLOW_MAX_PAGES', minimum=1),
     )
 
 
@@ -235,7 +217,7 @@ class KaipanlaSectorFundFlowFetcher:
                 row = parse_sector_row(item)
                 if row is None:
                     # 坏行不再无声无息：它同时进 log 和结果里的 invalid_row_count，
-                    # 最终落到采集运行的 missing_record_count 上。
+                    # 采集失败时由命令写进 `kaipanla_collection_incomplete` 那一行。
                     invalid_row_count += 1
                     continue
                 rows_by_code[row.sector_code] = row

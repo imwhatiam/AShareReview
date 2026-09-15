@@ -1,8 +1,11 @@
-"""Synchronization for public stock master data and trading calendar data."""
+"""Synchronization for public stock master data.
+
+Trading days are deliberately absent here: they are not upstream data, and are
+derived locally from ``chinese-calendar`` by ``core.services.calendar``.
+"""
 
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Callable
 
 from django.core.exceptions import ImproperlyConfigured
 from django.db import transaction
@@ -10,14 +13,8 @@ from django.db import transaction
 from backend.env import get_setting
 from core.integrations.hithink.client import HithinkClient
 from core.integrations.hithink.contracts import HithinkTicker
-from core.logging import ProgressReporter, log_command_progress
-from core.models import Stock, TradingDay
-from core.services.publication import (
-    begin_publication,
-    fail_publication,
-    publish_with_writer,
-    set_publication_details,
-)
+from core.logging import ProgressReporter
+from core.models import Stock
 
 # 股票主数据同步的最后一步是"把本次没出现的股票置为 inactive"。上游某次少返回
 # 若干页却不报错时，这一步会把大批股票静默停用，之后不再为它们采集行情。所以先用
@@ -93,107 +90,31 @@ def _validate_stock_master_coverage(tickers: tuple[HithinkTicker, ...]) -> None:
     )
 
 
-def _validate_trading_days(trading_days):
-    if not trading_days:
-        raise ValueError('Hithink returned an empty trading calendar.')
-    if tuple(sorted(trading_days)) != tuple(trading_days):
-        raise ValueError('Hithink returned trading days out of ascending order.')
-    if len(set(trading_days)) != len(trading_days):
-        raise ValueError('Hithink returned duplicate trading days.')
-    return tuple(trading_days)
-
-
-def _publish(
-    *,
-    dataset_key: str,
-    business_date,
-    fetch_records: Callable[[], tuple],
-    write_records: Callable[[tuple], None],
-    dry_run: bool,
-    validate_records: Callable[[tuple], None] | None = None,
-) -> ReferenceSyncResult:
-    if dry_run:
-        records = fetch_records()
-        if validate_records is not None:
-            validate_records(records)
-        return ReferenceSyncResult(dataset_key, len(records), True)
-
-    run = begin_publication('core', dataset_key, None, 0)
-    try:
-        records = fetch_records()
-        if validate_records is not None:
-            validate_records(records)
-        actual_business_date = business_date(records) if callable(business_date) else business_date
-        run = set_publication_details(
-            run,
-            len(records),
-            actual_business_date,
-        )
-    except Exception as error:
-        fail_publication(run, error)
-        raise
-
-    publish_with_writer(
-        run,
-        lambda: write_records(records),
-        actual_record_count=len(records),
-        missing_record_count=0,
-    )
-    return ReferenceSyncResult(dataset_key, len(records), False)
-
-
 def sync_stock_master(*, page_size: int = 1000, dry_run: bool = False):
+    """Replace the stock master in one transaction.
+
+    Nothing is written until the whole list has been fetched and its coverage
+    checked, so a bad upstream page can never leave the market half-deactivated.
+    """
     if not 1 <= page_size <= 10000:
         raise ValueError('page_size must be between 1 and 10000.')
-    client = HithinkClient()
+    tickers = _collect_tickers(HithinkClient(), page_size)
+    _validate_stock_master_coverage(tickers)
+    if dry_run:
+        return ReferenceSyncResult('stock_master', len(tickers), True)
 
-    def fetch_records():
-        return _collect_tickers(client, page_size)
-
-    def write_records(tickers):
-        with transaction.atomic():
-            Stock.objects.exclude(thscode__in=[ticker.thscode for ticker in tickers]).update(
-                is_active=False
+    with transaction.atomic():
+        Stock.objects.exclude(thscode__in=[ticker.thscode for ticker in tickers]).update(
+            is_active=False
+        )
+        for ticker in tickers:
+            Stock.objects.update_or_create(
+                thscode=ticker.thscode,
+                defaults={
+                    'stock_code': ticker.stock_code,
+                    'stock_name': ticker.stock_name,
+                    'exchange': ticker.exchange,
+                    'is_active': True,
+                },
             )
-            for ticker in tickers:
-                Stock.objects.update_or_create(
-                    thscode=ticker.thscode,
-                    defaults={
-                        'stock_code': ticker.stock_code,
-                        'stock_name': ticker.stock_name,
-                        'exchange': ticker.exchange,
-                        'is_active': True,
-                    },
-                )
-
-    return _publish(
-        dataset_key='stock_master',
-        business_date=None,
-        fetch_records=fetch_records,
-        write_records=write_records,
-        dry_run=dry_run,
-        validate_records=_validate_stock_master_coverage,
-    )
-
-
-def sync_trading_calendar(*, dry_run: bool = False):
-    client = HithinkClient()
-
-    def fetch_records():
-        log_command_progress('trading_calendar', action='fetching_calendar')
-        return _validate_trading_days(client.list_trading_days())
-
-    def write_records(trading_days):
-        with transaction.atomic():
-            TradingDay.objects.all().delete()
-            TradingDay.objects.bulk_create(
-                [TradingDay(trade_date=trading_day) for trading_day in trading_days]
-            )
-
-    return _publish(
-        dataset_key='trading_calendar',
-        business_date=lambda trading_days: trading_days[-1],
-        fetch_records=fetch_records,
-        write_records=write_records,
-        dry_run=dry_run,
-    )
+    return ReferenceSyncResult('stock_master', len(tickers), False)

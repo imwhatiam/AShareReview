@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -7,7 +7,6 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 from django.utils import timezone
 
-from core.models import DataVersion
 from core.services.file_cache import FileCache
 from kaipanla.models import KaipanlaSectorFundFlowSnapshot
 
@@ -30,18 +29,7 @@ class KaipanlaApiTests(TestCase):
                 trade_date=self.trade_date,
                 snapshot_time=timezone.make_aware(datetime(2026, 9, 8, 15, 0)),
                 main_net_inflow=Decimal(net_inflow),
-                # 行必须带上"发布它的版本"：读路径只服务已发布版本的行。
-                source_data_version='kaipanla-test-version',
-                source_batch_id='published-snapshot',
             )
-        DataVersion.objects.create(
-            dataset_key='kaipanla_sector_fund_flow',
-            version='kaipanla-test-version',
-            business_date=self.trade_date,
-            status=DataVersion.Status.COMPLETE,
-            expected_record_count=2,
-            actual_record_count=2,
-        )
         self.cache_directory = TemporaryDirectory()
         self.cache = FileCache(self.cache_directory.name, ttl_seconds=300, max_bytes=1_000_000)
         self.addCleanup(self.cache_directory.cleanup)
@@ -49,6 +37,17 @@ class KaipanlaApiTests(TestCase):
     def _authenticated_client(self):
         self.client.force_login(self.user)
         return self.client
+
+    def patch_now(self, *parts):
+        """固定默认入口看到的那一刻。
+
+        默认入口按本模块自己的最新快照日解析，并且只在"今天该有却还没有"时才
+        需要区分"还在盘中"与"已经收盘"，所以"现在几点"会改变它走哪条分支。
+        """
+        return patch(
+            'django.utils.timezone.now',
+            return_value=timezone.make_aware(datetime(*parts)),
+        )
 
     def test_endpoints_require_an_authenticated_session(self):
         response = self.client.get('/api/kaipanla/sectors/')
@@ -59,6 +58,8 @@ class KaipanlaApiTests(TestCase):
     @patch('kaipanla.services.read_path.default_file_cache')
     def test_intraday_reads_database_then_file_cache_with_shared_envelope(self, cache_factory):
         cache_factory.return_value = self.cache
+        written_at = timezone.now() - timedelta(days=30)
+        KaipanlaSectorFundFlowSnapshot.objects.using('kaipanla').update(created_at=written_at)
 
         first = self._authenticated_client().get(
             '/api/kaipanla/sectors/intraday/?date=2026-09-08&inflow_top=1&outflow_top=1'
@@ -70,8 +71,20 @@ class KaipanlaApiTests(TestCase):
         self.assertEqual(first.status_code, 200)
         self.assertEqual(first.json()['status'], 'ok')
         self.assertEqual(first.json()['business_date'], '2026-09-08')
-        self.assertEqual(first.json()['data_version'], 'kaipanla-test-version')
+        # 信封里没有版本号：缓存身份是"哪一天的哪个采集槽"，它留在服务端的
+        # `ReadResult.cache_identity`，属于缓存决策，不是响应字段。
+        self.assertNotIn('data_version', first.json())
         self.assertEqual(first.json()['source'], 'database')
+        self.assertFalse(first.json()['stale'])
+        # 「更新于」显示的时刻 = 这批快照写进库的时刻，取数据库与取文件缓存给的是同一个值
+        # （文件缓存只存载荷，信封每次重建）。它绝不等于 generated_at。
+        self.assertEqual(
+            datetime.fromisoformat(first.json()['data_updated_at']), written_at
+        )
+        self.assertEqual(second.json()['data_updated_at'], first.json()['data_updated_at'])
+        self.assertNotEqual(
+            first.json()['data_updated_at'], first.json()['generated_at']
+        )
         self.assertEqual(
             [item['code'] for item in first.json()['data']['series']], ['A', 'B']
         )
@@ -93,74 +106,70 @@ class KaipanlaApiTests(TestCase):
         self.assertEqual(unavailable.status_code, 404)
         self.assertEqual(unavailable.json()['error']['code'], 'DATA_NOT_AVAILABLE')
 
-    def test_dates_lists_only_published_complete_business_dates(self):
-        DataVersion.objects.create(
-            dataset_key='kaipanla_sector_fund_flow',
-            version='kaipanla-partial-version',
-            business_date=datetime(2026, 9, 7).date(),
-            status=DataVersion.Status.PARTIAL,
-            expected_record_count=2,
-            actual_record_count=1,
+    @patch('kaipanla.services.read_path.default_file_cache', return_value=None)
+    def test_dates_lists_the_stored_business_dates(self, cache):
+        """不挂文件缓存：`/dates/` 的缓存身份只看最新快照日与槽位，不看日期集合。
+
+        同一进程里前面的用例把 `['2026-09-08']` 写进真实缓存目录后，本用例再加一天
+        仍然会命中那条陈旧记录（`source` 变成 `cache`）。兄弟模块的 test_api 都对
+        `default_file_cache` 做了隔离，这里此前漏了。
+        """
+        KaipanlaSectorFundFlowSnapshot.objects.using('kaipanla').create(
+            sector_code='A',
+            sector_name='甲行业',
+            trade_date=datetime(2026, 9, 7).date(),
+            snapshot_time=timezone.make_aware(datetime(2026, 9, 7, 15, 0)),
+            main_net_inflow=Decimal('100000000'),
         )
 
         response = self._authenticated_client().get('/api/kaipanla/dates/')
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()['data']['dates'], ['2026-09-08'])
+        self.assertEqual(response.json()['data']['dates'], ['2026-09-08', '2026-09-07'])
         self.assertEqual(response.json()['source'], 'database')
 
-    @patch('kaipanla.services.read_path._repair_current_snapshot')
-    def test_dates_never_spends_an_upstream_request(self, repair):
-        """纯元信息端点被前端轮询：不能因为"问了有哪几天"就去抓一次上游。"""
-        DataVersion.objects.all().delete()
+    @patch('kaipanla.services.read_path.default_file_cache', return_value=None)
+    def test_dates_without_any_snapshot_is_404(self, cache):
+        """纯元信息端点被前端轮询：没有数据就是 404，它没有任何回源能力。"""
+        KaipanlaSectorFundFlowSnapshot.objects.using('kaipanla').all().delete()
 
         response = self._authenticated_client().get('/api/kaipanla/dates/')
 
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response.json()['error']['code'], 'DATA_NOT_AVAILABLE')
-        repair.assert_not_called()
 
-    @patch('kaipanla.services.read_path._can_attempt_repair', return_value=True)
-    @patch('kaipanla.services.read_path._repair_current_snapshot')
-    def test_missing_data_reports_sync_in_progress_when_repair_lock_is_held(
-        self, repair, can_repair
-    ):
-        from core.services.locking import DatasetBusy
-
-        DataVersion.objects.all().delete()
-        repair.side_effect = DatasetBusy(
-            'kaipanla:kaipanla_sector_fund_flow is already running.'
-        )
-
-        response = self._authenticated_client().get('/api/kaipanla/sectors/intraday/')
-
-        self.assertEqual(response.status_code, 409)
-        self.assertEqual(response.json()['error']['code'], 'SYNC_IN_PROGRESS')
-        self.assertEqual(response.json()['preparation']['state'], 'syncing')
-        can_repair.assert_called_once()
-        repair.assert_called_once()
-
-    def test_an_unpublished_snapshot_row_is_never_served(self):
-        """行已落库、版本还没标 complete：它既不能返回，也不能冒充上一个版本。
-
-        写行与发布分属 kaipanla / default 两个库，崩溃正好落在中间时会留下这种行；
-        旧代码会按 Max(snapshot_time) 取到它，然后用**上一个完整版本**的版本号返回
-        并按那个版本键写缓存，之后一直命中假缓存。
-        """
+    @patch('kaipanla.services.read_path.default_file_cache', return_value=None)
+    def test_the_default_entry_serves_today_once_today_has_a_snapshot(self, cache):
         KaipanlaSectorFundFlowSnapshot.objects.using('kaipanla').create(
             sector_code='C',
             sector_name='丙行业',
-            trade_date=self.trade_date,
-            snapshot_time=timezone.make_aware(datetime(2026, 9, 8, 15, 5)),
-            main_net_inflow=Decimal('999'),
-            source_data_version='kaipanla-running-version',
-            source_batch_id='crashed-batch',
+            trade_date=datetime(2026, 9, 9).date(),
+            snapshot_time=timezone.make_aware(datetime(2026, 9, 9, 9, 35)),
+            main_net_inflow=Decimal('300000000'),
         )
 
-        response = self._authenticated_client().get('/api/kaipanla/sectors/')
+        with self.patch_now(2026, 9, 9, 9, 40):
+            response = self._authenticated_client().get('/api/kaipanla/sectors/')
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()['data_version'], 'kaipanla-test-version')
-        self.assertEqual(
-            sorted(item['code'] for item in response.json()['data']['sectors']), ['A', 'B']
-        )
+        self.assertEqual(response.json()['business_date'], '2026-09-09')
+        self.assertFalse(response.json()['stale'])
+
+    @patch('kaipanla.services.read_path.default_file_cache', return_value=None)
+    def test_the_default_entry_answers_202_while_today_is_still_collecting(self, cache):
+        with self.patch_now(2026, 9, 9, 9, 32):
+            response = self._authenticated_client().get('/api/kaipanla/sectors/')
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()['status'], 'preparing')
+        self.assertEqual(response.json()['error']['code'], 'DATA_PREPARING')
+
+    @patch('kaipanla.services.read_path.default_file_cache', return_value=None)
+    def test_the_default_entry_serves_the_last_stored_day_as_stale_after_the_close(self, cache):
+        with self.patch_now(2026, 9, 9, 20, 0):
+            response = self._authenticated_client().get('/api/kaipanla/sectors/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['business_date'], '2026-09-08')
+        self.assertTrue(response.json()['stale'])
+        self.assertTrue(response.json()['warnings'])

@@ -1,34 +1,24 @@
-"""Resolve the current complete public industry-mapping version.
+"""Check that the current Kaipanla industry mapping is stored.
 
-The industry mapping is a *separate* dataset from the daily prices, and every
-post-close module stores one industry snapshot per stock in each of its result
-rows. Tracking only the daily-price version means a re-run of the industry
-mapping alone can never be detected: the stored industries stay behind while the
-response keeps claiming it is current. All three modules therefore depend on
-this one lookup, and a business module re-exports it rather than copying it
-(see e.g. ``hundred_day.services.source_versions``).
+The industry mapping is a *separate* public dataset from the daily prices, and
+every post-close module writes one industry snapshot per stock into each of its
+result rows. A day whose prices are stored but whose industry mapping is missing
+cannot be turned into a result at all — the rows would have to leave
+``industries`` empty, which the page renders as "no industry" rather than "not
+loaded yet". All three modules therefore share this one check instead of each
+testing the table themselves, and a business module re-exports it rather than
+copying it (see e.g. ``hundred_day.services.industry_source``).
 """
 
-from core.models import DataVersion
-
-INDUSTRY_SNAPSHOT_DATASET = 'industry_snapshot'
+from core.models import IndustrySnapshot
 
 
 class CompleteIndustrySnapshotUnavailable(LookupError):
-    """Raised when no complete Kaipanla industry mapping has been published."""
+    """Raised when no Kaipanla industry mapping is stored."""
 
 
-def get_complete_industry_snapshot_version() -> str:
-    version = (
-        DataVersion.objects.filter(
-            dataset_key=INDUSTRY_SNAPSHOT_DATASET,
-            status=DataVersion.Status.COMPLETE,
-        )
-        .order_by('-last_success_at', '-started_at')
-        .first()
-    )
-    if version is None:
+def require_industry_snapshot() -> None:
+    if not IndustrySnapshot.objects.exists():
         raise CompleteIndustrySnapshotUnavailable(
-            'No complete Kaipanla industry snapshot is available.'
+            'No Kaipanla industry snapshot is stored.'
         )
-    return version.version

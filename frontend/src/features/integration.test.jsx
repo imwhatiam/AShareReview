@@ -18,15 +18,15 @@ function deferred() {
 
 function response(tradeDate) {
   return {
-    status: 'ok', business_date: tradeDate, data_version: `hundred-day:${tradeDate}`,
+    status: 'ok', business_date: tradeDate,
     stale: false, warnings: [], data: { trade_date: tradeDate },
   }
 }
 
 /*
- * 四个页面的取数 hook 都是 `usePolledResource` 的薄包装，差别只在三处：请求路径、
- * 轮询间隔、"哪些 4xx 要带正文渲染"。取数语义（取消上一个请求、丢弃过期响应、
- * 静默重取）只在共享层实现一次。
+ * 四个页面的取数 hook 都是 `useResource` 的薄包装，差别只在两处：请求路径、
+ * "哪些 4xx 要带正文渲染"。取数语义（取消上一个请求、丢弃过期响应）只在共享层
+ * 实现一次；轮询已删除，什么时候发请求由调用方决定（页面上是「更新于」那颗胶囊）。
  *
  * 所以这里**按同一套不变量把四个页面逐个走一遍**，而不是只测其中一个：
  * 单页用例里，某个页面把 `date` 接错、漏进依赖数组、或者路径拼错，都不会有

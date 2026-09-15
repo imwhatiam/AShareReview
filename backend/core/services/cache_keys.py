@@ -20,15 +20,22 @@ def build_cache_key(
     module_id: str,
     endpoint: str,
     params: Mapping[str, object],
-    data_version: str,
+    cache_identity: str,
 ) -> CacheKey:
+    """Key one cached payload by module, endpoint, params and payload identity.
+
+    ``cache_identity`` is whatever makes the underlying rows "these rows and not
+    another set": the moment the served result row was written for the derived
+    modules, the newest collected slot for Kaipanla. It is part of the key so a
+    cached body can never outlive the data it was built from.
+    """
     if not _SAFE_MODULE_ID.fullmatch(module_id):
         raise ValueError('module_id must contain only lowercase letters, digits, and underscores.')
     material = json.dumps(
         {
             'endpoint': endpoint,
             'params': params,
-            'data_version': data_version,
+            'cache_identity': cache_identity,
         },
         ensure_ascii=False,
         sort_keys=True,

@@ -1,5 +1,3 @@
-from datetime import date
-
 from django.db import IntegrityError, transaction
 from django.test import TestCase
 
@@ -35,8 +33,8 @@ class MarketReferenceModelTests(TestCase):
 
         self.assertEqual(IndustrySnapshot.objects.count(), 2)
 
-    def test_stock_and_trading_day_have_their_natural_unique_keys(self):
-        from core.models import Stock, TradingDay
+    def test_stock_has_its_natural_unique_key(self):
+        from core.models import Stock
 
         Stock.objects.create(
             thscode='000001.SZ',
@@ -44,7 +42,6 @@ class MarketReferenceModelTests(TestCase):
             stock_name='平安银行',
             exchange=Stock.Exchange.SZSE,
         )
-        TradingDay.objects.create(trade_date=date(2026, 9, 8))
 
         with self.assertRaises(IntegrityError), transaction.atomic():
             Stock.objects.create(

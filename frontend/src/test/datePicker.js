@@ -23,8 +23,3 @@ export function pickDate(target) {
 
   fireEvent.click(screen.getByRole('button', { name: target }))
 }
-
-/* 触发器当前显示的日期文本；未选日期时是占位文案。 */
-export function shownDate() {
-  return screen.getByLabelText('数据日期').textContent
-}

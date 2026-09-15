@@ -4,35 +4,32 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from django.test import TestCase
+from django.utils import timezone
 
 from core.api.errors import ApiError, ErrorCode
-from core.models import DataVersion
+from core.models import IndustrySnapshot
 from core.services.cache_keys import build_cache_key
-from core.services.contracts import CompleteMarketSnapshot, MarketDataVersion, MarketPrice
+from core.services.contracts import CompleteMarketSnapshot, MarketPrice
 from core.services.file_cache import FileCache
 from core.services.locking import DatasetLocked
 from core.services.market_data import CompleteMarketDataUnavailable
-from stock_moves.models import StockMoveItem, StockMoveResult
+from stock_moves.models import StockMoveItem
 from stock_moves.services.read_path import read_stock_moves
 
 
 class StockMovesFallbackTests(TestCase):
     databases = {'default', 'stock_moves'}
 
-    INDUSTRY_VERSION = 'industries-20260908-v1'
-
     def setUp(self):
         self.trade_date = date(2026, 9, 8)
         self.next_trade_date = date(2026, 9, 9)
-        self.result = StockMoveResult.objects.using('stock_moves').create(
-            business_date=self.trade_date,
-            source_daily_price_version='daily-prices-20260908-v1',
-            source_industry_version=self.INDUSTRY_VERSION,
-            sse_rise_count=1,
-            distinct_stock_count=1,
+        # 行业映射是第二个输入，本地生成前会先确认它在库里。
+        IndustrySnapshot.objects.create(
+            industry_code='I001', industry_name='银行', stock_codes=['600001']
         )
-        StockMoveItem.objects.using('stock_moves').create(
-            result=self.result,
+        self.published_at = timezone.now()
+        self.item = StockMoveItem.objects.using('stock_moves').create(
+            business_date=self.trade_date,
             group=StockMoveItem.Group.SSE_RISE,
             rank=1,
             stock_code='600001',
@@ -40,6 +37,7 @@ class StockMovesFallbackTests(TestCase):
             industries=[],
             change_percent=Decimal('9'),
             turnover=Decimal('900000000'),
+            published_at=self.published_at,
         )
         self.cache_directory = TemporaryDirectory()
         self.cache = FileCache(self.cache_directory.name, ttl_seconds=300, max_bytes=1_000_000)
@@ -49,16 +47,8 @@ class StockMovesFallbackTests(TestCase):
         cache_patch = patch('stock_moves.services.read_path.default_file_cache', return_value=None)
         cache_patch.start()
         self.addCleanup(cache_patch.stop)
-        # 行业映射是第二个输入。生产环境由 sync_kaipanla_industry_snapshot 发布，
-        # 这里固定成一个稳定版本号，让"版本是否变化"成为用例里唯一可变的量。
-        industry_patch = patch(
-            'stock_moves.services.read_path.get_complete_industry_snapshot_version',
-            return_value=self.INDUSTRY_VERSION,
-        )
-        industry_patch.start()
-        self.addCleanup(industry_patch.stop)
 
-    def _snapshot(self, count=1, version='daily-prices-20260908-v2', trade_date=None):
+    def _snapshot(self, count=1, trade_date=None):
         day = trade_date or self.trade_date
         prices = tuple(
             MarketPrice(
@@ -80,26 +70,18 @@ class StockMovesFallbackTests(TestCase):
             for number in range(1, count + 1)
         )
         return CompleteMarketSnapshot(
-            data_version=MarketDataVersion(version=version, business_date=day),
+            business_date=day,
             prices=prices,
             industries=(),
-        )
-
-    def _complete_public_version(self, version, business_date=None):
-        return DataVersion.objects.create(
-            dataset_key='stock_daily_prices',
-            version=version,
-            business_date=business_date or self.trade_date,
-            status=DataVersion.Status.COMPLETE,
-            expected_record_count=1,
-            actual_record_count=1,
         )
 
     @patch('stock_moves.services.read_path.default_file_cache')
     def test_corrupted_cache_falls_back_to_database_data(self, cache_factory):
         cache_factory.return_value = self.cache
+        # 缓存身份 = 所服务那一行的发布时间，不是版本号。
         key = build_cache_key(
-            'stock_moves', 'result', {'date': '2026-09-08'}, 'daily-prices-20260908-v1'
+            'stock_moves', 'result', {'date': '2026-09-08'},
+            self.item.published_at.isoformat(),
         )
         path = self.cache.path_for(key)
         path.parent.mkdir(parents=True)
@@ -113,23 +95,63 @@ class StockMovesFallbackTests(TestCase):
     @patch('stock_moves.services.read_path.get_complete_market_snapshot')
     def test_missing_result_is_generated_from_local_public_snapshot(self, snapshot):
         StockMoveItem.objects.using('stock_moves').all().delete()
-        StockMoveResult.objects.using('stock_moves').all().delete()
         snapshot.return_value = self._snapshot()
 
         result = read_stock_moves(self.trade_date)
 
         self.assertEqual(result.source, 'computed')
         self.assertFalse(result.stale)
-        self.assertEqual(result.data_version, 'daily-prices-20260908-v2:industries-20260908-v1')
-        self.assertTrue(StockMoveResult.objects.using('stock_moves').filter(
-            source_daily_price_version='daily-prices-20260908-v2'
-        ).exists())
+        self.assertEqual(
+            StockMoveItem.objects.using('stock_moves')
+            .filter(business_date=self.trade_date).count(),
+            1,
+        )
+
+    @patch('stock_moves.services.read_path.get_complete_market_snapshot')
+    def test_missing_industry_mapping_makes_the_day_unavailable(self, snapshot):
+        """没有行业映射就生成不了：宁可"不可用"，也不落一份缺 industries 的结果。"""
+        StockMoveItem.objects.using('stock_moves').all().delete()
+        IndustrySnapshot.objects.all().delete()
+        snapshot.return_value = self._snapshot()
+
+        with self.assertRaises(CompleteMarketDataUnavailable):
+            read_stock_moves(self.trade_date)
+
+        self.assertFalse(StockMoveItem.objects.using('stock_moves').exists())
+
+    @patch('stock_moves.services.read_path.get_complete_market_snapshot')
+    def test_a_day_whose_stocks_all_miss_the_thresholds_renders_an_empty_board(self, snapshot):
+        """一天没有任何股票达标时表里没有行，但这一天仍然要能读出空看板。"""
+        StockMoveItem.objects.using('stock_moves').all().delete()
+        snapshot.return_value = CompleteMarketSnapshot(
+            business_date=self.trade_date, prices=(), industries=()
+        )
+
+        result = read_stock_moves(self.trade_date)
+
+        self.assertEqual(result.source, 'computed')
+        self.assertEqual(result.data['stock_codes'], [])
+        self.assertEqual(result.data['distinct_stock_count'], 0)
+        self.assertEqual(
+            set(result.data['group_counts'].values()), {0},
+        )
+        self.assertFalse(StockMoveItem.objects.using('stock_moves').exists())
+
+    @patch('stock_moves.services.read_path.get_complete_market_snapshot')
+    def test_a_stored_result_is_served_without_regenerating_it(self, snapshot):
+        """结果按业务日期唯一，读路径不做任何"是否过期"的比较。"""
+        snapshot.side_effect = AssertionError('a stored result must not be regenerated')
+
+        result = read_stock_moves(self.trade_date)
+
+        self.assertEqual(result.source, 'database')
+        self.assertFalse(result.stale)
+        self.assertEqual(result.data['stock_codes'], ['600001'])
 
     @patch('stock_moves.services.read_path.get_complete_market_snapshot')
     def test_large_snapshot_is_generated_without_a_row_budget(self, snapshot):
         """The local generation path is a computation, not a bounded remote repair."""
         StockMoveItem.objects.using('stock_moves').all().delete()
-        StockMoveResult.objects.using('stock_moves').all().delete()
         snapshot.return_value = self._snapshot(count=5000)
 
         result = read_stock_moves(self.trade_date)
@@ -145,17 +167,22 @@ class StockMovesFallbackTests(TestCase):
         with self.assertRaises(CompleteMarketDataUnavailable):
             read_stock_moves(self.next_trade_date)
 
-    @patch('core.services.sync_daily_prices.sync_stock_daily_prices')
+    @patch('core.services.sync_daily_prices.HithinkClient')
     @patch('stock_moves.services.read_path.get_complete_market_snapshot')
-    def test_absent_public_data_never_starts_remote_full_market_sync(self, snapshot, sync):
+    def test_absent_public_data_never_starts_an_upstream_fetch(self, snapshot, client):
+        """读路径要么用已存的数据回答，要么不回答 —— 绝不自己去抓。
+
+        锚点钉在上游客户端而不是某个命令的服务函数上：这个数据集的每一次抓取都要
+        过 ``HithinkClient``，所以换了入口（例如历史同步命令被删掉、只剩盘中刷新）
+        这条不变量依然守着，新加的命令也绕不过去。
+        """
         StockMoveItem.objects.using('stock_moves').all().delete()
-        StockMoveResult.objects.using('stock_moves').all().delete()
         snapshot.side_effect = CompleteMarketDataUnavailable('no complete public data')
 
         with self.assertRaises(CompleteMarketDataUnavailable):
             read_stock_moves(self.trade_date)
 
-        sync.assert_not_called()
+        client.assert_not_called()
 
     @patch('stock_moves.services.read_path.latest_complete_stock_price_date')
     @patch('stock_moves.services.read_path.get_complete_market_snapshot')
@@ -163,17 +190,13 @@ class StockMovesFallbackTests(TestCase):
         self, snapshot, latest_public
     ):
         StockMoveItem.objects.using('stock_moves').all().delete()
-        StockMoveResult.objects.using('stock_moves').all().delete()
         latest_public.return_value = self.next_trade_date
-        snapshot.return_value = self._snapshot(
-            version='daily-prices-20260909-v1', trade_date=self.next_trade_date
-        )
+        snapshot.return_value = self._snapshot(trade_date=self.next_trade_date)
 
         result = read_stock_moves()
 
         self.assertEqual(result.business_date, self.next_trade_date)
         self.assertEqual(result.source, 'computed')
-        self.assertEqual(result.data_version, 'daily-prices-20260909-v1:industries-20260908-v1')
         self.assertEqual(result.data['trade_date'], '2026-09-09')
 
     @patch('stock_moves.services.read_path.latest_complete_stock_price_date')
@@ -190,7 +213,7 @@ class StockMovesFallbackTests(TestCase):
         self.assertTrue(result.stale)
         self.assertEqual(result.source, 'database')
         self.assertIn(
-            '公共行情或开盘啦行业映射已更新，正在展示最近可用的分析结果。', result.warnings
+            '正在展示最近可用的分析结果，当日结果可能尚未生成。', result.warnings
         )
 
     @patch('stock_moves.services.read_path.latest_complete_stock_price_date')
@@ -216,7 +239,6 @@ class StockMovesFallbackTests(TestCase):
         它的语义，四个业务模块现在给出同一个答案。
         """
         StockMoveItem.objects.using('stock_moves').all().delete()
-        StockMoveResult.objects.using('stock_moves').all().delete()
         latest_public.return_value = self.next_trade_date
         lock.side_effect = DatasetLocked('stock_moves:stock_moves is already running.')
 
@@ -237,64 +259,3 @@ class StockMovesFallbackTests(TestCase):
 
         self.assertEqual(caught.exception.http_status, 409)
         self.assertEqual(caught.exception.code, ErrorCode.SYNC_IN_PROGRESS)
-
-    @patch('stock_moves.services.read_path.get_complete_industry_snapshot_version', return_value='industries-20260908-v2')
-    @patch('stock_moves.services.read_path.get_complete_market_snapshot')
-    def test_a_new_industry_version_alone_makes_the_result_stale_and_rebuilds_it(
-        self, snapshot, industry_version
-    ):
-        """每行都存着 industries：只重跑行业映射也必须被认出来并重建。
-
-        过去只跟踪公共日行情版本，此时结果会长期落后，而且 stale 还是 false。
-        """
-        snapshot.return_value = self._snapshot()
-
-        result = read_stock_moves(self.trade_date)
-
-        self.assertEqual(result.source, 'computed')
-        self.assertFalse(result.stale)
-        self.assertEqual(
-            result.data_version,
-            'daily-prices-20260908-v2:industries-20260908-v2',
-        )
-        self.assertTrue(StockMoveResult.objects.using('stock_moves').filter(
-            source_industry_version='industries-20260908-v2'
-        ).exists())
-
-    @patch('stock_moves.services.read_path.get_complete_industry_snapshot_version', return_value='industries-20260908-v2')
-    @patch('stock_moves.services.read_path.get_complete_market_snapshot')
-    def test_an_unrebuildable_industry_change_is_reported_as_stale(
-        self, snapshot, industry_version
-    ):
-        snapshot.side_effect = CompleteMarketDataUnavailable('no complete public data')
-
-        result = read_stock_moves(self.trade_date)
-
-        self.assertEqual(result.source, 'database')
-        self.assertTrue(result.stale)
-        self.assertEqual(
-            result.data_version,
-            'daily-prices-20260908-v1:industries-20260908-v1',
-        )
-
-    @patch('stock_moves.services.read_path.get_complete_market_snapshot')
-    def test_stale_result_is_regenerated_when_a_new_public_version_arrives(self, snapshot):
-        self._complete_public_version('daily-prices-20260908-v2')
-        snapshot.return_value = self._snapshot()
-
-        result = read_stock_moves(self.trade_date)
-
-        self.assertEqual(result.source, 'computed')
-        self.assertFalse(result.stale)
-        self.assertEqual(result.data_version, 'daily-prices-20260908-v2:industries-20260908-v1')
-
-    @patch('stock_moves.services.read_path.get_complete_market_snapshot')
-    def test_stale_result_is_kept_when_regeneration_is_unavailable(self, snapshot):
-        self._complete_public_version('daily-prices-20260908-v2')
-        snapshot.side_effect = CompleteMarketDataUnavailable('no complete public data')
-
-        result = read_stock_moves(self.trade_date)
-
-        self.assertEqual(result.source, 'database')
-        self.assertTrue(result.stale)
-        self.assertEqual(result.data_version, 'daily-prices-20260908-v1:industries-20260908-v1')

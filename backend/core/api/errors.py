@@ -87,7 +87,7 @@ def upstream_error_code(error: BaseException) -> ErrorCode | None:
         HithinkRateLimitError,
         HithinkUnavailableError,
     )
-    from core.integrations.kaipanla.client import (
+    from core.integrations.kaipanla.contracts import (
         KaipanlaRateLimitError,
         KaipanlaUnavailableError,
     )

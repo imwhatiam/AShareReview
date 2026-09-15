@@ -13,6 +13,7 @@
 3. [开盘啦 — 行业股票关系快照](#3-开盘啦--行业股票关系快照)
 4. [同花顺 — 个股公共市场数据与行业指数](#4-同花顺--个股公共市场数据)
 5. [通用约定](#5-通用约定)
+6. [已批准的数据源边界与实施约束](#6-已批准的数据源边界与实施约束)
 
 ---
 
@@ -22,7 +23,7 @@
 | --- | --- | --- | --- |
 | 开盘啦 | 板块资金流排行（分页） | `POST` | 1 |
 | 开盘啦 | 行业—股票关系快照 | `POST` | 2（复用同一 URL，不同 `a` 动作） |
-| 同花顺 | 个股基础信息 / 交易日历 / 行情快照 / 日线行情 | `GET` | 4 |
+| 同花顺 | 个股基础信息 / 行情快照 / 日线行情 | `GET` | 3 |
 | 同花顺 | 行业指数清单 / 行业成分股（881xxx，仅用于补齐北交所行业归属） | `GET` | 2 |
 
 ---
@@ -94,7 +95,7 @@ Order=1&a=RealRankingInfo&c=ZhiShuRanking&st=80&PhoneOSNew=1&VerSion=5.23.0.4&ap
 | `errcode` | 业务返回码，`"0"` 表示成功 |
 | `Time` | 数据时间戳（秒级） |
 | `Day` | 业务日期数组，首元素为数据所属交易日（`YYYY-MM-DD`） |
-| `Count` | 板块总数（用于计算总页数） |
+| `Count` | 板块总数（用于计算总页数）。**实测**：当前启用的 `Type=1` / `ZSType=4`（881xxx 行业族）恒为 104，在 `st=80` 下即 2 页 —— 任何"只取一页就算完整"的假设都不成立 |
 | `list` | 板块记录数组，每项为数组，按下标映射字段 |
 
 `list` 中每一项数组的下标含义：
@@ -174,7 +175,7 @@ if str(payload.get("errcode")) == "0":
 | 行业列表 `RealRankingInfo` | `https://apphis.longhuvip.com/w1/api/index.php` |
 | 股票列表 `ZhiShuStockList_W8` | `https://apphis.longhuvip.com/w1/api/index.php` |
 
-> 注意 `RealRankingInfo` 这个动作名在不同用途下挂在不同域名：**行业快照**用它取行业清单，域名是 `apphis`；**板块资金流**（第 2 节）也用它取名，域名却是 `apphwshhq`（`.env` 的 `KAIPANLA_API_URL`）。两者不要混用域名。
+> 注意 `RealRankingInfo` 这个动作名在不同用途下挂在不同域名：行业快照用它取行业清单，域名是 `apphis`；板块资金流（第 2 节）也用它取名，域名却是 `apphwshhq`（`.env` 的 `KAIPANLA_API_URL`）。两者不要混用域名。
 
 - **HTTP 方法**：`POST`
 - **Content-Type**：`application/x-www-form-urlencoded; charset=UTF-8`
@@ -392,7 +393,7 @@ print(result)
 
 ### 4.1 概述
 
-同花顺 REST API 提供 A 股个股公共市场数据：股票基础信息、交易日历、行情快照、历史日线行情。所有请求均通过 `X-api-key` 请求头鉴权。
+同花顺 REST API 提供 A 股个股公共市场数据：股票基础信息、行情快照、历史日线行情。所有请求均通过 `X-api-key` 请求头鉴权。
 
 - **Base URL**：`https://fuyao.aicubes.cn`
 
@@ -487,71 +488,7 @@ while True:
 print(tickers)
 ```
 
-### 4.4 请求二：交易日历
-
-- **HTTP 方法**：`GET`
-- **URL**：`https://fuyao.aicubes.cn/api/a-share/calendar/trading-days`
-
-#### 请求参数
-
-无。
-
-#### 请求示例
-
-```
-GET https://fuyao.aicubes.cn/api/a-share/calendar/trading-days
-X-api-key: <API_KEY>
-```
-
-#### 响应示例
-
-```json
-{
-  "code": 0,
-  "data": {
-    "item": [
-      {
-        "date": "20260105",
-        "date_ms": 1767542400000
-      },
-      {
-        "date": "20260106",
-        "date_ms": 1767628800000
-      }
-    ]
-  }
-}
-```
-
-#### 响应字段说明
-
-| 字段路径 | 说明 |
-| --- | --- |
-| `code` | 业务返回码，`0` 表示成功 |
-| `data.item` | 交易日数组（升序） |
-| `data.item[].date` | 交易日（`YYYYMMDD` 格式字符串） |
-| `data.item[].date_ms` | 交易日对应的毫秒时间戳（Asia/Shanghai） |
-
-#### Python `requests` 调用示例
-
-```python
-import requests
-
-url = "https://fuyao.aicubes.cn/api/a-share/calendar/trading-days"
-headers = {"X-api-key": "<API_KEY>"}
-
-resp = requests.get(url, headers=headers, timeout=10)
-resp.raise_for_status()
-payload = resp.json()
-if payload.get("code") != 0:
-    raise RuntimeError(f"业务码异常: {payload.get('code')}")
-
-items = (payload.get("data") or {}).get("item", [])
-trading_days = [item["date"] for item in items]
-print(trading_days)
-```
-
-### 4.5 请求三：行情快照
+### 4.4 请求二：行情快照
 
 - **HTTP 方法**：`GET`
 - **URL**：`https://fuyao.aicubes.cn/api/a-share/prices/snapshot`
@@ -657,7 +594,7 @@ print(result)
 
 ---
 
-### 4.6 请求四：历史日线行情
+### 4.5 请求三：历史日线行情
 
 - **HTTP 方法**：`GET`
 - **URL**：`https://fuyao.aicubes.cn/api/a-share/prices/historical`
@@ -753,7 +690,7 @@ bars = (payload.get("data") or {}).get("item", [])
 print(bars)
 ```
 
-### 4.7 请求五：同花顺行业指数清单
+### 4.6 请求四：同花顺行业指数清单
 
 - **HTTP 方法**：`GET`
 - **URL**：`https://fuyao.aicubes.cn/api/a-share-index/catalog/ths-index-list`
@@ -817,7 +754,7 @@ for item in (payload.get("data") or {}).get("item", []):
     print(industry_code, item["name"])   # 881129 通信设备
 ```
 
-### 4.8 请求六：同花顺行业成分股
+### 4.7 请求五：同花顺行业成分股
 
 - **HTTP 方法**：`GET`
 - **URL**：`https://fuyao.aicubes.cn/api/a-share-index/constituents/ths-stock-list`
@@ -887,7 +824,7 @@ for thscode in ["881129.TI", "881270.TI"]:      # 一次一个，逐行业调用
 print(codes)
 ```
 
-### 4.9 业务返回码
+### 4.8 业务返回码
 
 同花顺 REST 的业务返回码 `code` 取值：
 
@@ -923,3 +860,41 @@ print(codes)
 
 - 所有 API Key、Token、Device ID 等凭据应通过环境变量或配置文件注入，避免硬编码、记录或提交到版本库。
 - 示例中的 `<API_KEY>`、`replace-with-device-id` 均为占位符，请替换为真实值。
+
+---
+
+## 6. 已批准的数据源边界与实施约束
+
+### 已批准的数据源边界
+
+#### 同花顺 REST：个股公共市场数据
+
+- 鉴权：`X-api-key`，值仅从根目录 `.env` 的 `HITHINK_FINANCE_API_KEY` 读取。
+- 股票列表：`GET /api/meta/tickers/list`，使用 `asset_type=a-share` 分页取得全量 A 股。
+- 日线：对每个股票调用 `GET /api/a-share/prices/historical`，固定 `interval=1d` 与 `adjust=forward`，只请求最近一年。
+- 行业补齐：`GET /api/a-share-index/catalog/ths-index-list` 与 `GET /api/a-share-index/constituents/ths-stock-list`，**只用于补齐北交所行业归属**。
+- **交易日历不走上游**：交易日由 `chinese-calendar` 在本地推导（`core/services/calendar.py`），没有对应的上游端点，也不落库。
+
+股票列表与单股票最近一年历史日线均返回业务 `code=0`；最近一年日线为 242 行，字段包含 `date_ms`、OHLC、`volume` 和 `turnover`。
+
+#### 开盘啦：行业—股票关系
+
+行业—股票快照使用历史端点 `https://apphis.longhuvip.com/w1/api/index.php`；板块资金流使用实时端点 `https://apphwshhq.longhuvip.com/w1/api/index.php`。两条链路通过独立的 `.env` 配置项 `KAIPANLA_INDUSTRY_API_URL` 与 `KAIPANLA_API_URL` 管理，不能互相替代。**行业快照的两级调用（`RealRankingInfo` → `ZhiShuStockList_W8`）都走 `apphis`**；同名动作 `RealRankingInfo` 在板块资金流里走 `apphwshhq`，不要因为动作名相同就混用域名。
+
+`RealRankingInfo` 可获取行业列表、`ZhiShuStockList_W8` 可按行业分页获取股票列表。股票 `000801` 同时出现在多个行业的成分股中，故多行业归属是实际数据语义。
+
+行业族固定为 **`881xxx`**：`.env` 的 `KAIPANLA_INDUSTRY_PARENT_ZS_TYPE` 与 `KAIPANLA_FLOW_ZS_TYPE` 均为 `4`，配套 `Type=1`。行业—股票快照固定保存三个业务字段：`industry_code`、`industry_name` 和 `stock_codes`（JSON 股票代码数组）。若上游存在无成分股的行业，保留该记录并保存空数组。该表不保存历史有效期。
+
+#### 开盘啦凭据可选性
+
+三个 `KPL_*` 值（`KPL_DEVICE_ID`、`KPL_USER_ID`、`KPL_TOKEN`）都是**可选配置**，代码仅在值非空时发送相应字段。携带三个字段与完全省略三个字段两种模式都能取得板块资金流完整分页、行业列表与股票列表。**这只是当前上游行为的实测结果，不构成稳定的匿名访问承诺。**
+
+上游对未发布数据会返回业务码 `1020`，该失败与是否携带凭据无关。行业—股票同步应使用已发布的交易日快照，不能把盘中当日未发布数据误判为认证失败。
+
+### 实施约束与风险
+
+- 同花顺 REST 与开盘啦调用均采用可配置低并发、请求间隔、有限退避和超时。
+- HTTP 429 或业务码 `4001`、认证/权限错误、空数据和上游超时必须保留最近成功版本，不覆盖为完整版本。
+- 测试模拟上游响应，不依赖真实凭据；不得输出、记录或提交 API Key、Token 或 Device ID。
+- 禁止个股爬虫、浏览器自动化、上交所/深交所旧下载和 Baostock。
+- 公开文档未公布固定 QPS、并发或每日额度，连续请求可能遇到 HTTP 429。因此，逐股票最近一年初始化必须低频顺序执行，并可从失败处恢复。

@@ -7,111 +7,155 @@ from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.test import TestCase
 
-from core.services.contracts import MarketDataVersion, Industry
+from core.models import IndustrySnapshot
+from core.services.contracts import Industry
 from core.services.market_data import CompleteMarketDataUnavailable
 from hundred_day.models import (
+    HundredDayBreadth,
     HundredDayIndustrySummary,
-    HundredDayResult,
-    HundredDayRun,
     HundredDayStockFlag,
-    HundredDayTrend,
 )
 from hundred_day.services.analysis import (
     HistoricalCloseData,
-    InsufficientHundredDayHistory,
     TargetDayQuote,
 )
+
+_COMMAND_LOGGER = 'core.management'
+_SOURCE_DATA = 'hundred_day.management.commands.build_hundred_day.load_hundred_day_source_data'
 
 
 class BuildHundredDayCommandTests(TestCase):
     databases = {'default', 'hundred_day'}
     business_date = date(2026, 9, 8)
 
-    def _source(self, version='daily-prices-v1', positions=100):
+    def setUp(self):
+        # 行业归属决定板块汇总怎么分组，命令会先确认映射在库里。
+        IndustrySnapshot.objects.create(
+            industry_code='I001', industry_name='电子', stock_codes=['600001']
+        )
+
+    def _source(self, positions=100, business_date=None):
+        day = business_date or self.business_date
         days = tuple(
-            self.business_date - timedelta(days=positions - index - 1)
-            for index in range(positions)
+            day - timedelta(days=positions - index - 1) for index in range(positions)
         )
         return HistoricalCloseData(
-            data_version=MarketDataVersion(version, self.business_date),
+            business_date=day,
             trading_days=days,
             close_prices_by_stock={
-                '600001': {day: Decimal('10') for day in days[:-1]} | {days[-1]: Decimal('11')},
+                '600001': {value: Decimal('10') for value in days[:-1]}
+                | {days[-1]: Decimal('11')},
             },
             stock_names_by_code={'600001': '上涨股票'},
             industries=(Industry('I001', '电子', ('600001',)),),
             target_day_quotes={'600001': TargetDayQuote(Decimal('10'), Decimal('1000000'))},
         )
 
-    @patch('hundred_day.management.commands.build_hundred_day.get_complete_industry_snapshot_version')
-    @patch('hundred_day.management.commands.build_hundred_day.load_hundred_day_source_data')
-    def test_publishes_stock_industry_and_trend_records_from_local_public_data(self, source, industry_version):
+    def _breadth(self, **filters):
+        return HundredDayBreadth.objects.using('hundred_day').filter(**filters)
+
+    @patch(_SOURCE_DATA)
+    def test_writes_breadth_stock_and_industry_records_from_local_public_data(self, source):
         source.return_value = self._source()
-        industry_version.return_value = 'industries-v1'
         output = StringIO()
 
         call_command('build_hundred_day', '--date', '2026-09-08', stdout=output)
 
-        result = HundredDayResult.objects.using('hundred_day').get()
-        self.assertEqual(result.source_daily_price_version, 'daily-prices-v1')
-        self.assertEqual(result.source_industry_version, 'industries-v1')
-        self.assertEqual(result.valid_stock_count, 1)
+        # 100 个输入交易日只能评出最后一个（滚动窗口要 99 个前置位置），所以这次发布
+        # 的市场宽度只有一个点，而它就是当日结果。
+        point = self._breadth().get()
+        self.assertEqual(point.business_date, self.business_date)
+        self.assertEqual(point.trade_date, self.business_date)
+        self.assertEqual(point.valid_stock_count, 1)
+        self.assertEqual(point.new_high_count, 1)
+        self.assertEqual(point.new_low_count, 0)
         self.assertEqual(HundredDayStockFlag.objects.using('hundred_day').count(), 1)
-        self.assertEqual(HundredDayIndustrySummary.objects.using('hundred_day').get().new_high_count, 1)
-        self.assertEqual(HundredDayTrend.objects.using('hundred_day').count(), 1)
-        run = HundredDayRun.objects.using('hundred_day').get()
-        self.assertEqual(run.status, HundredDayRun.Status.SUCCESS)
-        self.assertEqual(run.published_result_id, result.pk)
+        # 行业汇总只留成分股数量；新高/新低数量是读时从个股标志算出来的。
+        summary = HundredDayIndustrySummary.objects.using('hundred_day').get()
+        self.assertEqual(summary.stock_count, 1)
         self.assertIn('built 1 hundred-day stock flags', output.getvalue())
 
-    @patch('hundred_day.management.commands.build_hundred_day.get_complete_industry_snapshot_version')
-    @patch('hundred_day.management.commands.build_hundred_day.load_hundred_day_source_data')
-    def test_dry_run_does_not_write_results_or_runs(self, source, industry_version):
+    @patch(_SOURCE_DATA)
+    def test_the_whole_window_is_published_as_the_trend(self, source):
+        """趋势点与当日汇总同表：199 个输入交易日评出 100 个点，全都落库。"""
+        source.return_value = self._source(positions=199)
+
+        call_command('build_hundred_day', '--date', '2026-09-08')
+
+        self.assertEqual(self._breadth().count(), 100)
+        latest = self._breadth().order_by('trade_date').last()
+        self.assertEqual(latest.trade_date, self.business_date)
+        self.assertEqual(latest.valid_stock_count, 1)
+        self.assertEqual(latest.new_high_count, 1)
+
+    @patch(_SOURCE_DATA)
+    def test_a_rebuild_replaces_the_days_rows_instead_of_adding_one(self, source):
+        """同一天重跑是覆盖这一天的全部行 —— 结果按业务日期唯一，没有版本号可比。"""
+        source.return_value = self._source(positions=199)
+
+        call_command('build_hundred_day', '--date', '2026-09-08')
+        call_command('build_hundred_day', '--date', '2026-09-08')
+
+        self.assertEqual(self._breadth().count(), 100)
+        self.assertEqual(HundredDayStockFlag.objects.using('hundred_day').count(), 1)
+        self.assertEqual(HundredDayIndustrySummary.objects.using('hundred_day').count(), 1)
+
+    @patch(_SOURCE_DATA)
+    def test_a_rebuild_moves_published_at_forward(self, source):
+        """重跑必须刷新发布时间 —— 它是文件缓存的缓存身份。
+
+        不前进的话，重建之后页面在 TTL 内还会继续拿到上一版报文。
+        """
         source.return_value = self._source()
-        industry_version.return_value = 'industries-v1'
+        call_command('build_hundred_day', '--date', '2026-09-08')
+        first = self._breadth().get().published_at
+
+        call_command('build_hundred_day', '--date', '2026-09-08')
+        second = self._breadth().get().published_at
+
+        self.assertGreater(second, first)
+
+    @patch(_SOURCE_DATA)
+    def test_dry_run_does_not_write_results(self, source):
+        source.return_value = self._source()
 
         call_command('build_hundred_day', '--date', '2026-09-08', '--dry-run')
 
-        self.assertFalse(HundredDayResult.objects.using('hundred_day').exists())
-        self.assertFalse(HundredDayRun.objects.using('hundred_day').exists())
+        self.assertFalse(self._breadth().exists())
+        self.assertFalse(HundredDayStockFlag.objects.using('hundred_day').exists())
+        self.assertFalse(HundredDayIndustrySummary.objects.using('hundred_day').exists())
 
-    @patch('hundred_day.management.commands.build_hundred_day.load_hundred_day_source_data')
-    def test_missing_complete_local_public_data_does_not_publish_and_records_failure(self, source):
-        source.side_effect = CompleteMarketDataUnavailable('no complete price version')
+    @patch(_SOURCE_DATA)
+    def test_missing_complete_local_public_data_writes_nothing_and_logs_the_failure(self, source):
+        source.side_effect = CompleteMarketDataUnavailable('No daily prices are stored.')
 
-        with self.assertRaises(CommandError):
-            call_command('build_hundred_day', '--date', '2026-09-08')
+        with self.assertLogs(_COMMAND_LOGGER, level='ERROR') as captured:
+            with self.assertRaises(CommandError):
+                call_command('build_hundred_day', '--date', '2026-09-08')
 
-        self.assertFalse(HundredDayResult.objects.using('hundred_day').exists())
-        run = HundredDayRun.objects.using('hundred_day').get()
-        self.assertEqual(run.status, HundredDayRun.Status.FAILED)
-        self.assertIn('no complete price version', run.error_summary)
+        self.assertFalse(self._breadth().exists())
+        self.assertIn('data_command_failed', '\n'.join(captured.output))
 
-    @patch('hundred_day.management.commands.build_hundred_day.get_complete_industry_snapshot_version')
-    @patch('hundred_day.management.commands.build_hundred_day.load_hundred_day_source_data')
-    def test_insufficient_history_does_not_publish_and_records_failure(self, source, industry_version):
+    @patch(_SOURCE_DATA)
+    def test_insufficient_history_writes_nothing_and_logs_the_failure(self, source):
         source.return_value = self._source(positions=99)
-        industry_version.return_value = 'industries-v1'
 
-        with self.assertRaises(CommandError):
+        with self.assertLogs(_COMMAND_LOGGER, level='ERROR') as captured:
+            with self.assertRaises(CommandError) as caught:
+                call_command('build_hundred_day', '--date', '2026-09-08')
+
+        self.assertIn('requires at least 100', str(caught.exception))
+        self.assertFalse(self._breadth().exists())
+        self.assertIn('data_command_failed', '\n'.join(captured.output))
+
+    @patch(_SOURCE_DATA)
+    def test_missing_industry_mapping_fails_without_writing_a_result(self, source):
+        """没有行业映射就没有板块分组：宁可失败，也不落一份空汇总的结果。"""
+        IndustrySnapshot.objects.all().delete()
+        source.return_value = self._source()
+
+        with self.assertRaises(CommandError) as caught:
             call_command('build_hundred_day', '--date', '2026-09-08')
 
-        run = HundredDayRun.objects.using('hundred_day').get()
-        self.assertEqual(run.status, HundredDayRun.Status.FAILED)
-        self.assertIn('requires at least 100', run.error_summary)
-
-    @patch('hundred_day.management.commands.build_hundred_day.get_complete_industry_snapshot_version')
-    @patch('hundred_day.management.commands.build_hundred_day.load_hundred_day_source_data')
-    def test_new_daily_price_version_creates_identifiable_rebuilt_result(self, source, industry_version):
-        source.side_effect = [self._source('daily-prices-v1'), self._source('daily-prices-v2')]
-        industry_version.return_value = 'industries-v1'
-
-        call_command('build_hundred_day', '--date', '2026-09-08')
-        call_command('build_hundred_day', '--date', '2026-09-08')
-
-        self.assertEqual(
-            set(HundredDayResult.objects.using('hundred_day').values_list(
-                'source_daily_price_version', flat=True
-            )),
-            {'daily-prices-v1', 'daily-prices-v2'},
-        )
+        self.assertIn('No Kaipanla industry snapshot is stored.', str(caught.exception))
+        self.assertFalse(self._breadth().exists())

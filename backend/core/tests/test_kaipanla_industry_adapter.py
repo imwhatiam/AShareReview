@@ -1,10 +1,8 @@
-from datetime import date, datetime
+from datetime import datetime
 from unittest.mock import patch
 
 from django.test import SimpleTestCase, TestCase
 from django.utils import timezone
-
-from core.models import TradingDay
 
 
 class FakeResponse:
@@ -79,6 +77,34 @@ class KaipanlaIndustryClientTests(SimpleTestCase):
             transport.calls[0]['url'],
             settings['KAIPANLA_INDUSTRY_API_URL'],
         )
+
+    def test_industry_and_flow_adapters_send_the_same_configured_headers(self):
+        """两个开盘啦端点必须报同一个客户端身份，且都听 ``KAIPANLA_USER_AGENT``。
+
+        此前行业适配器把 UA **硬编码**在请求里、资金流适配器才读配置，于是改
+        ``KAIPANLA_USER_AGENT`` 只会悄悄影响两个端点中的一个。
+        """
+        from core.integrations.kaipanla.client import KaipanlaIndustryClient
+        from core.integrations.kaipanla.contracts import DEFAULT_USER_AGENT, request_headers
+
+        transport = RecordingTransport([
+            FakeResponse(200, {'errcode': 0, 'list': []}),
+        ])
+        settings = {**self.settings, 'KAIPANLA_USER_AGENT': 'MarketReview/1.0'}
+
+        with patch.dict('os.environ', settings, clear=False):
+            expected = request_headers()
+            KaipanlaIndustryClient(transport=transport).list_industries()
+
+        self.assertEqual(expected['User-Agent'], 'MarketReview/1.0')
+        self.assertEqual(transport.calls[0]['headers'], expected)
+        self.assertEqual(expected['Content-Type'], 'application/x-www-form-urlencoded; charset=UTF-8')
+        self.assertEqual(expected['Accept-Encoding'], 'gzip')
+        self.assertEqual(expected['Connection'], 'Keep-Alive')
+
+        # 未配置时两个端点退回同一个兜底 UA，而不是各自持有不同的字面量。
+        with patch.dict('os.environ', {**self.settings, 'KAIPANLA_USER_AGENT': ''}, clear=False):
+            self.assertEqual(request_headers()['User-Agent'], DEFAULT_USER_AGENT)
 
     def test_parent_industry_request_uses_configured_real_ranking_contract(self):
         from core.integrations.kaipanla.client import KaipanlaIndustryClient
@@ -239,12 +265,6 @@ class KaipanlaIndustryRequestDateTests(TestCase):
     """
 
     settings = {**KaipanlaIndustryClientTests.settings, 'KAIPANLA_INDUSTRY_DATE': ''}
-
-    def setUp(self):
-        TradingDay.objects.bulk_create([
-            TradingDay(trade_date=value)
-            for value in (date(2026, 9, 10), date(2026, 9, 11))
-        ])
 
     def _request_date_at(self, *parts):
         from core.integrations.kaipanla.client import KaipanlaIndustryClient

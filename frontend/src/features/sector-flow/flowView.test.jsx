@@ -33,6 +33,25 @@ const outflows = Array.from({ length: 6 }, (_, index) => ({
   latest_net_inflow: index - 6,
 }))
 
+/*
+ * 完整交易时段的五分钟时点（09:30–11:30 / 13:00–15:00），与后端
+ * `trading_slots_for_day()` 产出的横轴同构。写成生成器而不是 50 个字面量：
+ * 这条用例关心的是"哪些时刻出刻度"，不是把整条轴再抄一遍。
+ */
+function sessionClockPoints() {
+  const points = []
+  const addSession = (fromMinutes, toMinutes) => {
+    for (let minutes = fromMinutes; minutes <= toMinutes; minutes += 5) {
+      const hour = String(Math.floor(minutes / 60)).padStart(2, '0')
+      const minute = String(minutes % 60).padStart(2, '0')
+      points.push(`${hour}:${minute}`)
+    }
+  }
+  addSession(9 * 60 + 30, 11 * 60 + 30)
+  addSession(13 * 60, 15 * 60)
+  return points
+}
+
 
 describe('sector-flow shared controls and charts', () => {
   beforeEach(() => {
@@ -179,26 +198,65 @@ describe('sector-flow shared controls and charts', () => {
   })
 
   /*
-   * 分时轴刻度必须落在"整十分钟"上：下午从 13:00 起、到 15:00 止。
-   * 按索引等间隔抽稀会跨过午休错位一格（13:05 … 14:55），这里锁死时刻判断。
+   * 分时轴刻度落在"整半点"上：整个交易时段只有 09:30 / 10:00 / … / 11:30 /
+   * 13:00 / … / 15:00 这 10 个时刻，整十分钟的点不再出现（横轴已是完整交易时段，
+   * 10 分钟一个刻度会在窄屏把相邻标签压在一起）。按索引等间隔抽稀会跨过午休错位
+   * 一格（13:05 … 14:55），所以判断按真实时刻。
+   * 午休两侧的 11:30 与 13:00 是轴上唯一相邻的一对整半点（间距 25.6px，而标签宽
+   * 27.0px），两个时刻都会有数据、都要显示，又不能叠字：靠**类目项自己的 textStyle**
+   * 朝外对齐（11:30 右对齐、13:00 左对齐）把两者分开。这条用例同时钉住"两个时刻都在"
+   * 与"对齐方向"，以及对齐只发生在这一对 —— 其余项仍是原始字符串。
    */
-  it('puts intraday axis ticks on clock ten-minute marks while keeping raw categories', async () => {
-    const timePoints = ['11:30', '13:00', '13:05', '13:15', '15:00']
+  it('shows both sides of the midday break as separate outward-aligned half-hour marks', async () => {
+    const timePoints = sessionClockPoints()
     render(
       <IntradayChart
         timePoints={timePoints}
         series={[{
-          code: 'I1', name: '流入行业1', latest_net_inflow: 1.2, data: [1, 2, 3, 4, 5],
+          code: 'I1',
+          name: '流入行业1',
+          latest_net_inflow: 1.2,
+          data: timePoints.map((_, index) => index),
         }]}
       />,
     )
 
     await waitFor(() => expect(setOption).toHaveBeenCalled())
     const option = setOption.mock.calls.at(-1)[0]
-    expect(option.xAxis.data).toEqual(timePoints)
+    const items = option.xAxis.data
+    // 轴上仍是原始刻度、顺序不变：只有午休两侧那两项裹上了 textStyle。
+    expect(items.map((item) => (typeof item === 'string' ? item : item.value))).toEqual(timePoints)
+    expect(
+      items
+        .map((item, index) => (
+          typeof item === 'string' ? null : { index, value: item.value, ...item.textStyle }
+        ))
+        .filter(Boolean),
+    ).toEqual([
+      { index: 24, value: '11:30', align: 'right' },
+      { index: 25, value: '13:00', align: 'left' },
+    ])
+
     const { interval } = option.xAxis.axisLabel
-    expect(timePoints.map((value, index) => interval(index, value)))
-      .toEqual([true, true, false, false, true])
+    expect(timePoints.filter((value, index) => interval(index, value))).toEqual([
+      '09:30', '10:00', '10:30', '11:00', '11:30', '13:00', '13:30', '14:00', '14:30', '15:00',
+    ])
+  })
+
+  /* 只画半天时没有相邻的整半点对：类目轴必须原样退回纯字符串数组。 */
+  it('leaves a half-session axis as plain category strings', async () => {
+    const timePoints = ['09:30', '09:35', '11:25', '11:30']
+    render(
+      <IntradayChart
+        timePoints={timePoints}
+        series={[{
+          code: 'I1', name: '流入行业1', latest_net_inflow: 1.2, data: [1, 2, 3, 4],
+        }]}
+      />,
+    )
+
+    await waitFor(() => expect(setOption).toHaveBeenCalled())
+    expect(setOption.mock.calls.at(-1)[0].xAxis.data).toEqual(timePoints)
   })
 
   it('leaves the multi-day date axis on the shared auto interval', async () => {

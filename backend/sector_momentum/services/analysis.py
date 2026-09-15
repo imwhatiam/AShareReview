@@ -22,8 +22,13 @@ class MomentumStock:
 
 @dataclass(frozen=True)
 class MomentumRanking:
+    """One industry's aggregate for one metric.
+
+    没有 ``rank`` 字段：名次是"这一批行业按评分排序"的函数，读路径在序列化时按
+    同一个排序规则现排（``read_path._serialize``），行里从来不存它。
+    """
+
     metric: str
-    rank: int
     industry_code: str
     industry_name: str
     stock_count: int
@@ -36,8 +41,6 @@ class MomentumRanking:
 
 @dataclass(frozen=True)
 class SectorMomentumAnalysis:
-    source_daily_price_version: str
-    source_industry_version: str
     total_market_turnover: Decimal
     unmapped_stock_count: int
     rankings_by_metric: dict[str, tuple[MomentumRanking, ...]]
@@ -97,7 +100,6 @@ def _build_rankings(
         rankings.append(
             MomentumRanking(
                 metric=metric,
-                rank=0,
                 industry_code=industry_code,
                 industry_name=industry_name,
                 stock_count=stock_count,
@@ -109,18 +111,17 @@ def _build_rankings(
             )
         )
 
-    sorted_rankings = sorted(
+    # 评分降序、同分按行业代码升序，只保留前 ``_MAX_RANKINGS`` 名。名次本身不派发：
+    # 读路径按同一条规则重排时自然得出（``read_path._serialize``）。此前这里为了给
+    # 一个没人读的 ``rank`` 字段赋值，用 `__dict__` 把每个对象整个重建一遍。
+    return tuple(sorted(
         rankings,
         key=lambda value: (-value.score, value.industry_code),
-    )[:_MAX_RANKINGS]
-    return tuple(
-        MomentumRanking(**{**ranking.__dict__, 'rank': index})
-        for index, ranking in enumerate(sorted_rankings, start=1)
-    )
+    )[:_MAX_RANKINGS])
 
 
 def build_sector_momentum_analysis(
-    snapshot: CompleteMarketSnapshot, source_industry_version: str
+    snapshot: CompleteMarketSnapshot,
 ) -> SectorMomentumAnalysis:
     """Build both metrics from one complete local market-data snapshot."""
     valid_prices = tuple(price for price in snapshot.prices if _is_valid_price(price))
@@ -138,8 +139,6 @@ def build_sector_momentum_analysis(
     )[:top_sample_size])
 
     return SectorMomentumAnalysis(
-        source_daily_price_version=snapshot.data_version.version,
-        source_industry_version=source_industry_version,
         total_market_turnover=total_market_turnover,
         unmapped_stock_count=unmapped_stock_count,
         rankings_by_metric={

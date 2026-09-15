@@ -63,13 +63,7 @@ describe('DataState', () => {
   })
 
   it('never renders the removed business-date and data-version chips', () => {
-    render(
-      <DataState
-        state="empty"
-        businessDate="2026-09-09"
-        dataVersion="kaipanla:20260909-1"
-      />,
-    )
+    render(<DataState state="empty" businessDate="2026-09-09" />)
 
     expect(screen.getByText('暂无数据')).toBeInTheDocument()
     expect(screen.queryByText(/^业务日期：/)).not.toBeInTheDocument()

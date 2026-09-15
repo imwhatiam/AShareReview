@@ -59,7 +59,6 @@ input {
 }
 
 /* 数字统一等宽对齐，方便纵向对比 */
-.num,
 .ranking__value,
 .stat-row strong {
   font-variant-numeric: tabular-nums;
@@ -823,6 +822,9 @@ a:focus-visible {
  * .updated-at 额外把纵向内边距与字号对齐 .date-picker__trigger（0.4rem + 正文号），
  * 这样 .toolbar 的 align-items: center 下它与日期控件上下边缘齐平（同 .segmented__item）。
  * 时间用 tabular-nums：分钟数变化时宽度不跳。
+ * 「更新于」本身是一颗 <button>（点它取一次新数据），所以补上手型光标与悬停反馈：
+ * 它长得像标签，必须有"可以点"的信号，否则用户不会想到去点它。悬停只用中性色加深
+ * （边框 + 文字），不用品牌蓝、更不用红绿 —— 红绿是涨跌专用色。
  */
 .data-meta__chip,
 .updated-at {
@@ -843,6 +845,16 @@ a:focus-visible {
   padding: 0.4rem var(--space-3);
   font-size: var(--text-base);
   font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.updated-at:hover {
+  border-color: var(--color-border-strong);
+  color: var(--color-ink-900);
+}
+
+.updated-at:active {
+  background: var(--color-surface-sunken);
 }
 
 .data-meta__stale {

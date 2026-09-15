@@ -6,7 +6,7 @@ import useKaipanlaData from './useKaipanlaData'
 export default function KaipanlaPage({ apiClient }) {
   const [date, setDate] = useState('')
   const [days, setDays] = useState(1)
-  const { phase, envelope, refreshedAt } = useKaipanlaData({ apiClient, date, days })
+  const { phase, envelope, updatedAt, refresh } = useKaipanlaData({ apiClient, date, days })
 
   /*
    * 所有统计窗口都以最近一个已发布交易日为终点：点任一窗口按钮都清空手选日期，
@@ -26,8 +26,8 @@ export default function KaipanlaPage({ apiClient }) {
       days={days}
       onDateChange={setDate}
       onWindowChange={handleWindowChange}
-      errorMessage="开盘啦数据暂时无法加载。"
-      refreshedAt={refreshedAt}
+      updatedAt={updatedAt}
+      onRefresh={refresh}
     />
   )
 }

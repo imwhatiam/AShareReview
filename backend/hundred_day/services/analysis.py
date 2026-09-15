@@ -5,7 +5,7 @@ from datetime import date
 from decimal import Decimal
 from typing import Mapping
 
-from core.services.contracts import MarketDataVersion, Industry
+from core.services.contracts import Industry
 from hundred_day.services.flags import HighLowFlag, HighLowFlagResult, compute_high_low_flags
 
 MAX_INPUT_TRADING_DAY_POSITIONS = 199
@@ -28,7 +28,7 @@ class TargetDayQuote:
 class HistoricalCloseData:
     """The bounded local public-data input needed for hundred-day analysis."""
 
-    data_version: MarketDataVersion
+    business_date: date
     trading_days: tuple[date, ...]
     close_prices_by_stock: Mapping[str, Mapping[date, Decimal | None]]
     stock_names_by_code: Mapping[str, str]
@@ -44,47 +44,50 @@ class HundredDayStockAnalysis:
     industries: tuple[dict[str, str], ...]
     is_new_high: bool
     is_new_low: bool
-
-
-@dataclass(frozen=True)
-class HundredDayStockDetail:
-    """板块明细里的一只股票：名称加当日涨幅与成交额。"""
-
-    stock_code: str
-    stock_name: str
     change_percent: Decimal | None
     turnover: Decimal | None
 
 
 @dataclass(frozen=True)
 class HundredDayIndustryAnalysis:
+    """One parent industry's aggregates.
+
+    只有 ``stock_count`` 落库 —— 它含未被标记的成分股，推不出来。新高低计数是
+    ``HundredDayStockFlag`` 的函数，读路径按 ``industries`` 分组现算（见
+    ``services/read_path.py``）；写入时不再算第二遍，那样只会多一份可能与读结果
+    不一致的副本。
+    """
+
     industry_code: str
     industry_name: str
     stock_count: int
-    new_high_count: int
-    new_low_count: int
-    new_high_stocks: tuple[HundredDayStockDetail, ...]
-    new_low_stocks: tuple[HundredDayStockDetail, ...]
 
 
 @dataclass(frozen=True)
 class HundredDayTrendAnalysis:
+    """One point of the trend chart, i.e. one row of the market-breadth table.
+
+    只带落库的三个计数：两个占比是它们与 ``valid_stock_count`` 的商，读路径序列化时
+    现算并按 ``_TREND_RATIO_PLACES`` 收尾（``read_path._ratio_text``）。
+    """
+
     trade_date: date
     valid_stock_count: int
     new_high_count: int
     new_low_count: int
-    new_high_ratio: Decimal | None
-    new_low_ratio: Decimal | None
 
 
 @dataclass(frozen=True)
 class HundredDayAnalysis:
+    """One business date's hundred-day result.
+
+    ``trend_points`` 覆盖分析窗口里的每一个交易日，其中 ``trade_date`` 等于
+    ``business_date`` 的那一点**就是当日结果**：写进市场宽度表之后，业务日期那一行
+    同时扮演"当日"与"趋势最后一个点"，读路径从那一行取当日数字（见
+    ``read_path._serialize``）。所以这里不再单独挂一份当日汇总。
+    """
+
     business_date: date
-    source_daily_price_version: str
-    source_industry_version: str
-    valid_stock_count: int
-    new_high_count: int
-    new_low_count: int
     stock_flags: tuple[HundredDayStockAnalysis, ...]
     industry_summaries: tuple[HundredDayIndustryAnalysis, ...]
     trend_points: tuple[HundredDayTrendAnalysis, ...]
@@ -114,65 +117,48 @@ def _stock_analysis(
     source: HistoricalCloseData,
     memberships: Mapping[str, tuple[dict[str, str], ...]],
 ) -> tuple[HundredDayStockAnalysis, ...]:
-    return tuple(
-        HundredDayStockAnalysis(
-            stock_code=flag.stock_code,
-            stock_name=source.stock_names_by_code.get(flag.stock_code, flag.stock_code),
-            industries=memberships.get(flag.stock_code, ()),
-            is_new_high=flag.is_new_high,
-            is_new_low=flag.is_new_low,
+    """Attach the target-day quote to every flag.
+
+    行情就在这里落到个股标志上，行业维度的明细名单不再单独存一份：一只股票属于
+    多个行业时，它会在每个行业的名单里出现，但涨幅与成交额只在这里写一次。
+    """
+    analyses = []
+    for flag in flags:
+        quote = source.target_day_quotes.get(flag.stock_code)
+        analyses.append(
+            HundredDayStockAnalysis(
+                stock_code=flag.stock_code,
+                stock_name=source.stock_names_by_code.get(flag.stock_code, flag.stock_code),
+                industries=memberships.get(flag.stock_code, ()),
+                is_new_high=flag.is_new_high,
+                is_new_low=flag.is_new_low,
+                change_percent=None if quote is None else quote.change_percent,
+                turnover=None if quote is None else quote.turnover,
+            )
         )
-        for flag in flags
-    )
-
-
-def _stock_detail(
-    stock_code: str,
-    flagged_by_stock: Mapping[str, HundredDayStockAnalysis],
-    quotes: Mapping[str, TargetDayQuote],
-) -> HundredDayStockDetail:
-    quote = quotes.get(stock_code)
-    return HundredDayStockDetail(
-        stock_code=stock_code,
-        stock_name=flagged_by_stock[stock_code].stock_name,
-        change_percent=quote.change_percent if quote is not None else None,
-        turnover=quote.turnover if quote is not None else None,
-    )
+    return tuple(analyses)
 
 
 def _industry_summaries(
     *,
-    stock_flags: tuple[HundredDayStockAnalysis, ...],
     valid_stock_codes: set[str],
     industries: tuple[Industry, ...],
-    quotes: Mapping[str, TargetDayQuote],
 ) -> tuple[HundredDayIndustryAnalysis, ...]:
-    flagged_by_stock = {flag.stock_code: flag for flag in stock_flags}
+    """Count each industry's valid constituents; the stock lists are rebuilt on read."""
     summaries: list[HundredDayIndustryAnalysis] = []
     for industry in sorted(industries, key=lambda item: item.code):
-        stock_codes = tuple(sorted(set(industry.stock_codes) & valid_stock_codes))
-        high_stocks = tuple(
-            _stock_detail(stock_code, flagged_by_stock, quotes)
-            for stock_code in stock_codes
-            if stock_code in flagged_by_stock and flagged_by_stock[stock_code].is_new_high
-        )
-        low_stocks = tuple(
-            _stock_detail(stock_code, flagged_by_stock, quotes)
-            for stock_code in stock_codes
-            if stock_code in flagged_by_stock and flagged_by_stock[stock_code].is_new_low
-        )
-        if stock_codes or high_stocks or low_stocks:
-            summaries.append(
-                HundredDayIndustryAnalysis(
-                    industry_code=industry.code,
-                    industry_name=industry.name,
-                    stock_count=len(stock_codes),
-                    new_high_count=len(high_stocks),
-                    new_low_count=len(low_stocks),
-                    new_high_stocks=high_stocks,
-                    new_low_stocks=low_stocks,
-                )
+        # 只取"有效成分股数"：先排序再取长度是白做的功。
+        stock_count = len(set(industry.stock_codes) & valid_stock_codes)
+        # 名单是从 stock_codes 里筛出来的，所以「有名单」必然「有成分股」：判空只需看计数。
+        if not stock_count:
+            continue
+        summaries.append(
+            HundredDayIndustryAnalysis(
+                industry_code=industry.code,
+                industry_name=industry.name,
+                stock_count=stock_count,
             )
+        )
     return tuple(summaries)
 
 
@@ -181,34 +167,21 @@ def _trend_points(flag_result: HighLowFlagResult) -> tuple[HundredDayTrendAnalys
     points = []
     for trade_date in trend_days:
         flags = flag_result.flags_by_date[trade_date]
-        valid_stock_count = flag_result.valid_stock_counts_by_date[trade_date]
-        new_high_count = sum(flag.is_new_high for flag in flags)
-        new_low_count = sum(flag.is_new_low for flag in flags)
         points.append(
             HundredDayTrendAnalysis(
                 trade_date=trade_date,
-                valid_stock_count=valid_stock_count,
-                new_high_count=new_high_count,
-                new_low_count=new_low_count,
-                new_high_ratio=(
-                    Decimal(new_high_count) / Decimal(valid_stock_count)
-                    if valid_stock_count else None
-                ),
-                new_low_ratio=(
-                    Decimal(new_low_count) / Decimal(valid_stock_count)
-                    if valid_stock_count else None
-                ),
+                valid_stock_count=flag_result.valid_stock_counts_by_date[trade_date],
+                new_high_count=sum(flag.is_new_high for flag in flags),
+                new_low_count=sum(flag.is_new_low for flag in flags),
             )
         )
     return tuple(points)
 
 
-def build_hundred_day_analysis(
-    source: HistoricalCloseData, *, source_industry_version: str
-) -> HundredDayAnalysis:
+def build_hundred_day_analysis(source: HistoricalCloseData) -> HundredDayAnalysis:
     """Build target-day stock and parent-industry results plus a bounded trend."""
-    if not source.trading_days or source.trading_days[-1] != source.data_version.business_date:
-        raise ValueError('The target daily-price version must match the final trading-day position.')
+    if not source.trading_days or source.trading_days[-1] != source.business_date:
+        raise ValueError('The source business date must match the final trading-day position.')
     if len(source.trading_days) > MAX_INPUT_TRADING_DAY_POSITIONS:
         raise ValueError(
             f'Hundred-day analysis accepts at most {MAX_INPUT_TRADING_DAY_POSITIONS} positions.'
@@ -222,7 +195,7 @@ def build_hundred_day_analysis(
             f'only {flag_result.available_trading_day_positions} are available.'
         )
 
-    business_date = source.data_version.business_date
+    business_date = source.business_date
     target_flags = flag_result.flags_by_date[business_date]
     memberships = _industries_by_stock(source.industries)
     stock_flags = _stock_analysis(target_flags, source, memberships)
@@ -234,17 +207,10 @@ def build_hundred_day_analysis(
     trend_points = _trend_points(flag_result)
     return HundredDayAnalysis(
         business_date=business_date,
-        source_daily_price_version=source.data_version.version,
-        source_industry_version=source_industry_version,
-        valid_stock_count=flag_result.valid_stock_counts_by_date[business_date],
-        new_high_count=sum(flag.is_new_high for flag in target_flags),
-        new_low_count=sum(flag.is_new_low for flag in target_flags),
         stock_flags=stock_flags,
         industry_summaries=_industry_summaries(
-            stock_flags=stock_flags,
             valid_stock_codes=valid_stock_codes,
             industries=source.industries,
-            quotes=source.target_day_quotes,
         ),
         trend_points=trend_points,
     )

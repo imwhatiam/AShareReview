@@ -35,7 +35,7 @@ class BaseDataCommand(BaseCommand):
 
         The operator reads this line in the terminal or in a crontab mail, where
         ``Data synchronization failed.`` alone is unusable: the actual cause
-        (``The requested date is not in the trading calendar.``) used to be
+        (``The requested date is not a trading day.``) used to be
         written only to the log file. The original message is redacted first, so
         a credential that somehow ended up in it cannot leak into a console.
         """

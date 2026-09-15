@@ -10,8 +10,19 @@ from typing import Any
 import requests
 from django.core.exceptions import ImproperlyConfigured
 
-from backend.env import get_required_setting, get_setting
-from core.api.errors import ErrorCode
+from backend.env import (
+    get_required_float_setting,
+    get_required_int_setting,
+    get_required_setting,
+    get_setting,
+)
+from core.api.errors import upstream_error_code_value
+from core.integrations.kaipanla.contracts import (
+    KaipanlaPayloadError,
+    KaipanlaRateLimitError,
+    KaipanlaUnavailableError,
+    request_headers,
+)
 from core.logging import elapsed_ms, log_event
 
 
@@ -21,23 +32,6 @@ logger = logging.getLogger(__name__)
 # 上游单页的硬上限：`st` 超过它会被服务端当成坏请求。定义在这里而不是散落成
 # 字面量，因为读路径的"一次修复至多 80 行"这个结论就是从它推出来的。
 MAX_PAGE_SIZE = 80
-
-
-class KaipanlaUnavailableError(RuntimeError):
-    """The upstream service did not complete a usable request."""
-
-
-class KaipanlaRateLimitError(KaipanlaUnavailableError):
-    """The upstream service refused the request because we are being throttled.
-
-    Subclassed so every existing ``except KaipanlaUnavailableError`` still
-    catches it, while the read path can answer ``503 UPSTREAM_RATE_LIMITED``
-    instead of retrying into a throttled endpoint.
-    """
-
-
-class KaipanlaPayloadError(RuntimeError):
-    """The upstream service returned an invalid payload."""
 
 
 @dataclass(frozen=True)
@@ -59,31 +53,9 @@ class KaipanlaSectorFundFlowClientSettings:
     request_delay_seconds: float = 0.0
 
 
-def _positive_integer_setting(name: str, *, minimum: int = 0) -> int:
-    value = get_required_setting(name)
-    try:
-        parsed = int(value)
-    except ValueError as error:
-        raise ImproperlyConfigured(f'{name} must be an integer.') from error
-    if parsed < minimum:
-        raise ImproperlyConfigured(f'{name} must be at least {minimum}.')
-    return parsed
-
-
-def _non_negative_float_setting(name: str) -> float:
-    value = get_required_setting(name)
-    try:
-        parsed = float(value)
-    except ValueError as error:
-        raise ImproperlyConfigured(f'{name} must be numeric.') from error
-    if parsed < 0:
-        raise ImproperlyConfigured(f'{name} must not be negative.')
-    return parsed
-
-
 def flow_client_settings() -> KaipanlaSectorFundFlowClientSettings:
     """Read all Kaipanla flow endpoint parameters from the repository .env."""
-    page_size = _positive_integer_setting('KAIPANLA_FLOW_PAGE_SIZE', minimum=1)
+    page_size = get_required_int_setting('KAIPANLA_FLOW_PAGE_SIZE', minimum=1)
     if page_size > MAX_PAGE_SIZE:
         raise ImproperlyConfigured(
             f'KAIPANLA_FLOW_PAGE_SIZE must not exceed {MAX_PAGE_SIZE}.'
@@ -96,14 +68,14 @@ def flow_client_settings() -> KaipanlaSectorFundFlowClientSettings:
         version=get_required_setting('KPL_VERSION'),
         api_version=get_required_setting('KPL_API_VERSION'),
         phone_os_new=get_required_setting('KPL_PHONE_OS_NEW'),
-        timeout_seconds=_positive_integer_setting('KAIPANLA_TIMEOUT_SECONDS', minimum=1),
+        timeout_seconds=get_required_int_setting('KAIPANLA_TIMEOUT_SECONDS', minimum=1),
         controller=get_required_setting('KAIPANLA_FLOW_CONTROLLER'),
         action=get_required_setting('KAIPANLA_FLOW_ACTION'),
         order=get_required_setting('KAIPANLA_FLOW_ORDER'),
         ranking_type=get_required_setting('KAIPANLA_FLOW_TYPE'),
         zs_type=get_required_setting('KAIPANLA_FLOW_ZS_TYPE'),
         page_size=page_size,
-        request_delay_seconds=_non_negative_float_setting('KAIPANLA_REQUEST_DELAY_SECONDS'),
+        request_delay_seconds=get_required_float_setting('KAIPANLA_REQUEST_DELAY_SECONDS'),
     )
 
 
@@ -126,18 +98,11 @@ class KaipanlaSectorFundFlowClient:
             response = self.transport.post(
                 self.settings.endpoint,
                 data=self._form_data(offset),
-                headers={
-                    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                    'User-Agent': get_setting(
-                        'KAIPANLA_USER_AGENT',
-                        'Dalvik/2.1.0 (Linux; U; Android 12; ALN-AL00 Build/W528JS)',
-                    ),
-                    'Accept-Encoding': 'gzip',
-                    'Connection': 'Keep-Alive',
-                },
+                headers=request_headers(),
                 timeout=self.settings.timeout_seconds,
             )
         except requests.RequestException as error:
+            failure = KaipanlaUnavailableError('Kaipanla request could not be completed.')
             log_event(
                 logger,
                 'upstream_failed',
@@ -146,10 +111,21 @@ class KaipanlaSectorFundFlowClient:
                 offset=offset,
                 duration_ms=elapsed_ms(started_at),
                 error=error,
-                error_code=ErrorCode.UPSTREAM_UNAVAILABLE.value,
+                error_code=upstream_error_code_value(failure),
             )
-            raise KaipanlaUnavailableError('Kaipanla request could not be completed.') from error
+            raise failure from error
         if not 200 <= response.status_code < 300:
+            # `error_code` 从异常类型推出，不写死：429 走 `UPSTREAM_RATE_LIMITED`、
+            # 其余走 `UPSTREAM_UNAVAILABLE`。此前 429 那一支漏了这个字段、网络
+            # 那一支把它写死成 `UPSTREAM_UNAVAILABLE`，"被限流"和"上游挂了"在日志
+            # 里长得一模一样。
+            failure = (
+                KaipanlaRateLimitError('Kaipanla request was throttled.')
+                if response.status_code == 429
+                else KaipanlaUnavailableError(
+                    'Kaipanla request returned a non-success status.'
+                )
+            )
             log_event(
                 logger,
                 'upstream_failed',
@@ -158,10 +134,10 @@ class KaipanlaSectorFundFlowClient:
                 offset=offset,
                 status=response.status_code,
                 duration_ms=elapsed_ms(started_at),
+                error=failure,
+                error_code=upstream_error_code_value(failure),
             )
-            if response.status_code == 429:
-                raise KaipanlaRateLimitError('Kaipanla request was throttled.')
-            raise KaipanlaUnavailableError('Kaipanla request returned a non-success status.')
+            raise failure
         logger.debug(
             '%s provider=kaipanla_flow offset=%s status=%s duration_ms=%s',
             'upstream_ok',

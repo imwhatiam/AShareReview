@@ -4,12 +4,6 @@ from decimal import Decimal
 
 
 @dataclass(frozen=True)
-class MarketDataVersion:
-    version: str
-    business_date: date
-
-
-@dataclass(frozen=True)
 class MarketPrice:
     stock_code: str
     thscode: str
@@ -36,6 +30,6 @@ class Industry:
 
 @dataclass(frozen=True)
 class CompleteMarketSnapshot:
-    data_version: MarketDataVersion
+    business_date: date
     prices: tuple[MarketPrice, ...]
     industries: tuple[Industry, ...]

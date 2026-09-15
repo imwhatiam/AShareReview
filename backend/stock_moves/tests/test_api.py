@@ -5,10 +5,10 @@ from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
+from django.utils import timezone
 
-from core.models import DataVersion
 from core.services.file_cache import FileCache
-from stock_moves.models import StockMoveItem, StockMoveResult
+from stock_moves.models import StockMoveItem
 
 
 class StockMovesApiTests(TestCase):
@@ -19,27 +19,10 @@ class StockMovesApiTests(TestCase):
         self.user = get_user_model().objects.create_user(
             username='stock-moves-user', password='correct-password'
         )
-        DataVersion.objects.create(
-            dataset_key='industry_snapshot',
-            version='industries-20260908-v1',
-            status=DataVersion.Status.COMPLETE,
-            expected_record_count=1,
-            actual_record_count=1,
-        )
-        self.result = StockMoveResult.objects.using('stock_moves').create(
-            business_date=self.trade_date,
-            source_daily_price_version='daily-prices-20260908-v1',
-            source_industry_version='industries-20260908-v1',
-            sse_rise_count=1,
-            sse_fall_count=0,
-            szse_rise_count=1,
-            szse_fall_count=0,
-            distinct_stock_count=2,
-            warnings=['股票 000001 未映射到开盘啦板块。'],
-        )
+        self.published_at = timezone.now()
         StockMoveItem.objects.using('stock_moves').bulk_create([
             StockMoveItem(
-                result=self.result,
+                business_date=self.trade_date,
                 group=StockMoveItem.Group.SSE_RISE,
                 rank=1,
                 stock_code='600001',
@@ -47,9 +30,10 @@ class StockMovesApiTests(TestCase):
                 industries=[{'code': 'I001', 'name': '银行'}],
                 change_percent=Decimal('9'),
                 turnover=Decimal('900000000'),
+                published_at=self.published_at,
             ),
             StockMoveItem(
-                result=self.result,
+                business_date=self.trade_date,
                 group=StockMoveItem.Group.SZSE_RISE,
                 rank=1,
                 stock_code='000001',
@@ -57,6 +41,7 @@ class StockMovesApiTests(TestCase):
                 industries=[],
                 change_percent=Decimal('8'),
                 turnover=Decimal('800000000'),
+                published_at=self.published_at,
             ),
         ])
         self.cache_directory = TemporaryDirectory()
@@ -83,8 +68,11 @@ class StockMovesApiTests(TestCase):
         self.assertEqual(first.status_code, 200)
         self.assertEqual(first.json()['status'], 'partial')
         self.assertEqual(first.json()['business_date'], '2026-09-08')
-        self.assertEqual(first.json()['data_version'], 'daily-prices-20260908-v1:industries-20260908-v1')
+        # 版本概念已删除：信封里不再有 data_version。结果按业务日期唯一，缓存身份
+        # 留在服务内部，第二次请求命中缓存即证明它稳定。
+        self.assertNotIn('data_version', first.json())
         self.assertEqual(first.json()['source'], 'database')
+        # 六组计数由这一天的行算出来，不再是单独存的字段。
         self.assertEqual(
             first.json()['data']['group_counts'],
             {
@@ -104,13 +92,36 @@ class StockMovesApiTests(TestCase):
         self.assertEqual(second.json()['data'], first.json()['data'])
 
     @patch('stock_moves.services.read_path.default_file_cache')
+    def test_warnings_are_rebuilt_from_the_rows_that_need_them(self, cache_factory):
+        """告警不落库：名称缺失 / 行业为空这两条由行本身推出来。"""
+        cache_factory.return_value = self.cache
+        StockMoveItem.objects.using('stock_moves').create(
+            business_date=self.trade_date,
+            group=StockMoveItem.Group.BSE_RISE,
+            rank=1,
+            stock_code='920045',
+            stock_name='',
+            industries=[],
+            change_percent=Decimal('9.81'),
+            turnover=Decimal('1218000000'),
+            published_at=self.published_at,
+        )
+
+        response = self._authenticated_client().get('/api/stock-moves/?date=2026-09-08')
+
+        warnings = response.json()['warnings']
+        self.assertIn('股票 920045 名称缺失。', warnings)
+        self.assertIn('股票 920045 未映射到开盘啦板块。', warnings)
+        self.assertIn('股票 000001 未映射到开盘啦板块。', warnings)
+
+    @patch('stock_moves.services.read_path.default_file_cache')
     def test_bse_groups_are_returned_after_the_four_exchange_groups_and_copied_too(
         self, cache_factory
     ):
         cache_factory.return_value = self.cache
         StockMoveItem.objects.using('stock_moves').bulk_create([
             StockMoveItem(
-                result=self.result,
+                business_date=self.trade_date,
                 group=StockMoveItem.Group.BSE_RISE,
                 rank=1,
                 stock_code='920045',
@@ -118,9 +129,10 @@ class StockMovesApiTests(TestCase):
                 industries=[{'code': 'I007', 'name': '通信'}],
                 change_percent=Decimal('9.81'),
                 turnover=Decimal('1218000000'),
+                published_at=self.published_at,
             ),
             StockMoveItem(
-                result=self.result,
+                business_date=self.trade_date,
                 group=StockMoveItem.Group.BSE_FALL,
                 rank=1,
                 stock_code='920046',
@@ -128,13 +140,9 @@ class StockMovesApiTests(TestCase):
                 industries=[],
                 change_percent=Decimal('-8.42'),
                 turnover=Decimal('900000000'),
+                published_at=self.published_at,
             ),
         ])
-        StockMoveResult.objects.using('stock_moves').filter(pk=self.result.pk).update(
-            bse_rise_count=1,
-            bse_fall_count=1,
-            distinct_stock_count=4,
-        )
 
         response = self._authenticated_client().get('/api/stock-moves/?date=2026-09-08')
 
@@ -168,10 +176,16 @@ class StockMovesApiTests(TestCase):
     @patch('stock_moves.services.read_path.default_file_cache')
     def test_dates_lists_distinct_available_result_dates(self, cache_factory):
         cache_factory.return_value = self.cache
-        StockMoveResult.objects.using('stock_moves').create(
+        StockMoveItem.objects.using('stock_moves').create(
             business_date=date(2026, 9, 7),
-            source_daily_price_version='daily-prices-20260907-v1',
-            source_industry_version='industries-20260907-v1',
+            group=StockMoveItem.Group.SSE_RISE,
+            rank=1,
+            stock_code='600009',
+            stock_name='前一天',
+            industries=[],
+            change_percent=Decimal('9'),
+            turnover=Decimal('900000000'),
+            published_at=self.published_at,
         )
 
         response = self._authenticated_client().get('/api/stock-moves/dates/')

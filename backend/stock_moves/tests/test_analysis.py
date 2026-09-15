@@ -5,7 +5,6 @@ from django.test import SimpleTestCase
 
 from core.services.contracts import (
     CompleteMarketSnapshot,
-    MarketDataVersion,
     MarketPrice,
     Industry,
 )
@@ -45,14 +44,12 @@ class StockMoveAnalysisTests(SimpleTestCase):
 
     def _snapshot(self, prices, industries=()):
         return CompleteMarketSnapshot(
-            data_version=MarketDataVersion(
-                version='daily-prices-20260908-v1', business_date=self.business_date
-            ),
+            business_date=self.business_date,
             prices=tuple(prices),
             industries=tuple(industries),
         )
 
-    def test_uses_inclusive_thresholds_and_builds_all_six_exchange_groups(self):
+    def test_uses_inclusive_thresholds_on_change_percent_and_turnover(self):
         result = build_stock_move_analysis(self._snapshot([
             self._price('600001', 'sse', '8.000000', '800000000'),
             self._price('600002', 'sse', '-8.000000', '800000000'),
@@ -62,6 +59,8 @@ class StockMoveAnalysisTests(SimpleTestCase):
             self._price('000003', 'szse', '-8.000000', '799999999.9999'),
         ]))
 
+        # 阈值取闭区间：涨跌幅恰为 8%、成交额恰为 8 亿的两只都在结果里；
+        # 各差一点点的 600003 / 000003 都不在。
         self.assertEqual(
             [(item.group, item.stock_code) for item in result.items],
             [
@@ -71,15 +70,6 @@ class StockMoveAnalysisTests(SimpleTestCase):
                 (StockMoveItem.Group.SZSE_FALL, '000002'),
             ],
         )
-        self.assertEqual(result.group_counts, {
-            StockMoveItem.Group.SSE_RISE: 1,
-            StockMoveItem.Group.SSE_FALL: 1,
-            StockMoveItem.Group.SZSE_RISE: 1,
-            StockMoveItem.Group.SZSE_FALL: 1,
-            StockMoveItem.Group.BSE_RISE: 0,
-            StockMoveItem.Group.BSE_FALL: 0,
-        })
-        self.assertEqual(result.distinct_stock_count, 4)
 
     def test_sorts_rises_descending_falls_ascending_with_stock_code_tiebreaker(self):
         result = build_stock_move_analysis(self._snapshot([
@@ -112,6 +102,7 @@ class StockMoveAnalysisTests(SimpleTestCase):
             self._price('000003', 'szse', '10', '900000000', valid=False),
         ]))
 
+        # 北交所股票以独立分组出现在结果里 —— 页面上是"行=市场、列=涨跌"的看板。
         self.assertEqual(
             [(item.group, item.stock_name) for item in result.items],
             [
@@ -119,12 +110,6 @@ class StockMoveAnalysisTests(SimpleTestCase):
                 (StockMoveItem.Group.BSE_RISE, '股票430001'),
             ],
         )
-        self.assertEqual(result.group_counts[StockMoveItem.Group.BSE_RISE], 1)
-        self.assertEqual(result.group_counts[StockMoveItem.Group.BSE_FALL], 0)
-        self.assertEqual(result.distinct_stock_count, 2)
-        # 北交所股票不再只以"已排除 N 只"的形式出现在告警里。
-        self.assertFalse(any('北京证券交易所' in warning for warning in result.warnings))
-        self.assertTrue(any('名称缺失' in warning for warning in result.warnings))
 
     def test_bse_groups_split_by_direction_and_sort_each_way(self):
         result = build_stock_move_analysis(self._snapshot([
@@ -163,9 +148,8 @@ class StockMoveAnalysisTests(SimpleTestCase):
         ]))
 
         self.assertEqual(result.items, ())
-        self.assertEqual(result.warnings, ())
 
-    def test_keeps_all_matching_parent_industry_labels_and_reports_unmapped_stocks(self):
+    def test_keeps_all_matching_parent_industry_labels_and_unmapped_stocks(self):
         result = build_stock_move_analysis(self._snapshot(
             [
                 self._price('600001', 'sse', '10', '900000000'),
@@ -182,13 +166,24 @@ class StockMoveAnalysisTests(SimpleTestCase):
             {'code': 'I001', 'name': '电子'},
             {'code': 'I002', 'name': '半导体'},
         ))
-        self.assertTrue(any('600002' in warning and '未映射' in warning for warning in result.warnings))
+        # 未映射到任何板块的股票照样进结果（只是 industries 为空）；"未映射到开盘啦
+        # 板块"那条告警由读路径从行现算，见 tests/test_api.py。
+        self.assertEqual(
+            [(entry.stock_code, entry.industries) for entry in result.items],
+            [
+                ('600001', (
+                    {'code': 'I001', 'name': '电子'},
+                    {'code': 'I002', 'name': '半导体'},
+                )),
+                ('600002', ()),
+            ],
+        )
 
-    def test_allows_empty_groups(self):
+    def test_main_board_stocks_below_either_threshold_are_left_out(self):
         result = build_stock_move_analysis(self._snapshot([
             self._price('600001', 'sse', '1', '1'),
         ]))
 
+        # 阈值两侧都不满足时既没有分组计数要维护，也没有空组要补齐 —— 六组恒存在
+        # 的契约由读路径组装（tests/test_api.py）保证。
         self.assertEqual(result.items, ())
-        self.assertEqual(result.distinct_stock_count, 0)
-        self.assertEqual(sum(result.group_counts.values()), 0)

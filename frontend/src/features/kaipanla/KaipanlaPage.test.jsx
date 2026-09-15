@@ -2,7 +2,10 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 
 import { pickDate } from '../../test/datePicker'
+import { DATA_UPDATED_AT, envelope } from '../../test/envelope'
+import { expectRefreshRefetches } from '../../test/refreshStamp'
 import KaipanlaPage from './KaipanlaPage'
+import { buildKaipanlaPath } from './useKaipanlaData'
 
 vi.mock('../sector-flow/IntradayChart', () => ({
   default: ({ series }) => <div>分时图：{series.map((item) => item.name).join('、')}</div>,
@@ -10,18 +13,6 @@ vi.mock('../sector-flow/IntradayChart', () => ({
 vi.mock('../sector-flow/HistoryChart', () => ({
   default: ({ series }) => <div>多日图：{series.map((item) => item.name).join('、')}</div>,
 }))
-
-function envelope(data, overrides = {}) {
-  return {
-    status: 'ok',
-    business_date: '2026-09-09',
-    data_version: 'kaipanla:1',
-    stale: false,
-    warnings: [],
-    data,
-    ...overrides,
-  }
-}
 
 const dailyData = {
   trade_date: '2026-09-09',
@@ -71,12 +62,17 @@ describe('KaipanlaPage', () => {
     expect(rankings.querySelectorAll('.ranking')).toHaveLength(2)
   })
 
-  it('switches dates and windows, retaining selections for the same business date but resetting on a new date', async () => {
+  /*
+   * 2026-09-15：默认勾选改成"每次取数后按该次榜单重算"（此前用 business_date 当闸门，
+   * 同一天内一律保留旧勾选）。换窗口 / 换日期都会带回一份新响应，两条路都要重算 ——
+   * 这里先手动取消一项，再断言它在换窗口之后回到勾选态。
+   */
+  it('switches dates and windows, re-deriving the default selections from each response', async () => {
     const apiClient = {
       request: vi.fn(async (path) => {
         if (path.includes('date=2026-09-08')) {
           return envelope(historyData, {
-            business_date: '2026-09-08', data_version: 'kaipanla:2',
+            business_date: '2026-09-08',
           })
         }
         if (path.includes('/history/')) return envelope(historyData)
@@ -86,12 +82,14 @@ describe('KaipanlaPage', () => {
     render(<KaipanlaPage apiClient={apiClient} />)
 
     const inflow = await screen.findByRole('checkbox', { name: /流入甲/ })
+    await waitFor(() => expect(inflow).toBeChecked())
     fireEvent.click(inflow)
     expect(inflow).not.toBeChecked()
 
     fireEvent.click(screen.getByRole('button', { name: '5日' }))
-    expect(await screen.findByText('多日图：流出乙')).toBeInTheDocument()
-    expect(screen.getByRole('checkbox', { name: /流入甲/ })).not.toBeChecked()
+    expect(await screen.findByText('多日图：流入甲、流出乙')).toBeInTheDocument()
+    // 5日榜单同样是"流入甲 + 流出乙"，重算后刚才手动取消的那一项回到勾选态。
+    await waitFor(() => expect(screen.getByRole('checkbox', { name: /流入甲/ })).toBeChecked())
 
     pickDate('2026-09-08')
     expect(await screen.findByText('多日图：流入甲、流出乙')).toBeInTheDocument()
@@ -111,7 +109,7 @@ describe('KaipanlaPage', () => {
       request: vi.fn(async (path) => {
         if (path.includes('date=2026-09-08')) {
           return envelope(historyData, {
-            business_date: '2026-09-08', data_version: 'kaipanla:2',
+            business_date: '2026-09-08',
           })
         }
         if (path.includes('/history/')) return envelope(historyData)
@@ -225,5 +223,52 @@ describe('KaipanlaPage', () => {
     const failedClient = { request: vi.fn().mockRejectedValue(new Error('network')) }
     render(<KaipanlaPage apiClient={failedClient} />)
     expect(await screen.findByRole('alert')).toHaveTextContent('开盘啦数据暂时无法加载。')
+  })
+
+  it('re-requests the same URL when「更新于」is clicked', () =>
+    expectRefreshRefetches(KaipanlaPage, {
+      payload: dailyData,
+      endpoint: buildKaipanlaPath({ date: '', days: 1 }),
+    }))
+
+  /*
+   * 2026-09-15（用户报障）：点「更新于 HH:MM」刷新后，两张榜单的条目换成了新数据，但
+   * 勾选还停在刷新前那批板块上 —— 旧勾选的板块一旦掉出新榜单，两个榜单的勾选框会全部
+   * 空着、折线图也一条线都不画，看起来就是"榜单没刷新好"。
+   *
+   * 这里让第二次响应换掉整份板块集合（业务日期不变），断言刷新后勾选与折线图都落在新
+   * 数据的默认前 5 名上，而不是留在旧板块上。
+   */
+  it('re-derives the default selections from the refreshed rankings', async () => {
+    const refreshedData = {
+      trade_date: '2026-09-09',
+      time_points: ['09:30', '09:45'],
+      series: [
+        { code: 'C', name: '新贵丙', latest_net_inflow: 9.9, data: [1.0, 9.9] },
+        { code: 'D', name: '新贵丁', latest_net_inflow: -8.8, data: [-1.0, -8.8] },
+      ],
+    }
+    const apiClient = {
+      request: vi.fn()
+        .mockResolvedValueOnce(envelope(dailyData, { data_updated_at: DATA_UPDATED_AT }))
+        .mockResolvedValueOnce(envelope(refreshedData, { data_updated_at: DATA_UPDATED_AT })),
+    }
+    render(<KaipanlaPage apiClient={apiClient} />)
+
+    const staleCheckbox = await screen.findByRole('checkbox', { name: /流入甲/ })
+    await waitFor(() => expect(staleCheckbox).toBeChecked())
+
+    fireEvent.click(screen.getByRole('button', { name: /更新于 15:35/ }))
+
+    /*
+     * 折线图文案必须当同步点：它只有在"勾选已按新数据重算"之后才可能出现
+     * （重算前 selectedCodes 还是旧板块，一条线都画不出来）。先等它，再断勾选框，
+     * 否则断言可能落在"榜单已换新、勾选还没重算"的那一帧上，变成 flaky。
+     */
+    expect(await screen.findByText('分时图：新贵丙、新贵丁')).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByRole('checkbox', { name: /新贵丙/ })).toBeChecked())
+    expect(screen.getByRole('checkbox', { name: /新贵丁/ })).toBeChecked()
+    // 旧板块已不在新榜单里，连同它的勾选框一起消失。
+    expect(screen.queryByRole('checkbox', { name: /流入甲/ })).not.toBeInTheDocument()
   })
 })

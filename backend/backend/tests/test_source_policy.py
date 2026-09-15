@@ -16,7 +16,6 @@ APPROVED_REQUEST_CLIENTS = {
 }
 HITHINK_ENDPOINTS = {
     '/api/meta/tickers/list',
-    '/api/a-share/calendar/trading-days',
     '/api/a-share/prices/historical',
     # 全市场实时行情快照：盘中半小时刷新所有个股当日交易数据的通道。
     '/api/a-share/prices/snapshot',
@@ -56,7 +55,7 @@ class SourcePolicyTests(SimpleTestCase):
         }
         self.assertEqual(actual, APPROVED_REQUEST_CLIENTS)
 
-    def test_hithink_client_uses_only_approved_stock_and_calendar_endpoints(self):
+    def test_hithink_client_uses_only_approved_stock_endpoints(self):
         source = (BACKEND_ROOT / 'core/integrations/hithink/client.py').read_text(encoding='utf-8')
         for endpoint in HITHINK_ENDPOINTS:
             with self.subTest(endpoint=endpoint):

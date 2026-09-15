@@ -2,19 +2,9 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { pickDate } from '../../test/datePicker'
+import { envelope } from '../../test/envelope'
+import { expectRefreshRefetches } from '../../test/refreshStamp'
 import StockMovesPage from './StockMovesPage'
-
-function envelope(data, overrides = {}) {
-  return {
-    status: 'ok',
-    business_date: '2026-09-09',
-    data_version: 'stock-moves:1',
-    stale: false,
-    warnings: [],
-    data,
-    ...overrides,
-  }
-}
 
 const results = {
   trade_date: '2026-09-09',
@@ -212,7 +202,7 @@ describe('StockMovesPage', () => {
   })
 
   /*
-   * 日期控件在任何数据状态下都必须保持挂载：`usePolledResource` 在 path 变化时
+   * 日期控件在任何数据状态下都必须保持挂载：`useResource` 在 path 变化时
    * 会把 phase 打回 loading，若页面据此整页替换，用户刚在弹层里点完一天，控件就被
    * 卸载重建 —— 弹层、焦点、滚动位置全丢，页面还会先塌成一行提示再弹回来。
    */
@@ -235,4 +225,7 @@ describe('StockMovesPage', () => {
     // 没有数据时不渲染依赖数据的复制动作。
     expect(screen.queryByRole('button', { name: /全部复制/ })).not.toBeInTheDocument()
   })
+
+  it('re-requests the same day when「更新于」is clicked', () =>
+    expectRefreshRefetches(StockMovesPage, { payload: results, endpoint: '/api/stock-moves/' }))
 })

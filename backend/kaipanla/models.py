@@ -1,4 +1,18 @@
-"""Local data models for the independently deployable Kaipanla module."""
+"""Local data models for the independently deployable Kaipanla module.
+
+One table, one job: a collection appends one row per sector per five-minute
+slot, and the API reads those rows back. There is deliberately no run table and
+no cross-database bookkeeping — a failed collection leaves nothing behind but a
+log line, and the read path answers from whatever rows exist. The reasoning is
+in ``services/read_path.py``.
+
+八列只写不读的观测值（``change_pct`` / ``main_buy`` / ``main_sell`` /
+``large_order_net_inflow`` / ``volume_ratio`` / ``turnover_amount`` /
+``float_market_cap`` / ``total_market_cap``）目前没有任何读方 —— API 只用板块名、
+主力净流入与快照时刻。它们是**有意采全**的，不是漏删：这些值不是别的行的函数，
+删掉就再也算不出来，只能等下一次采集；对采集型系统来说，把上游给的观测值先落库
+备查是常态。逐行成本已量化（约 838 字节/行），真需要瘦身时再连同历史数据一起决定。
+"""
 
 from django.db import models
 from django.utils import timezone
@@ -11,6 +25,8 @@ class KaipanlaSectorFundFlowSnapshot(models.Model):
     sector_name = models.CharField(max_length=64, verbose_name='开盘啦板块名称')
     trade_date = models.DateField(db_index=True, verbose_name='交易日')
     snapshot_time = models.DateTimeField(db_index=True, verbose_name='快照时间（5分钟对齐）')
+    # 从这里到 ``total_market_cap`` 这几列只写不读，留着是有意的决定 —— 理由见
+    # 模块 docstring（2026-09-15 结构审查已确认，不是漏删）。
     change_pct = models.DecimalField(
         max_digits=9, decimal_places=3, null=True, blank=True, verbose_name='涨跌幅（%）'
     )
@@ -38,13 +54,6 @@ class KaipanlaSectorFundFlowSnapshot(models.Model):
     total_market_cap = models.DecimalField(
         max_digits=24, decimal_places=2, null=True, blank=True, verbose_name='总市值（元）'
     )
-    # 写入这份快照的 DataVersion。没有它，"行已经落库、版本还没标 complete"的那个
-    # 崩溃窗口会把新数据打上**旧**版本号返回（并按旧版本键写缓存，之后一直命中假
-    # 缓存）。读路径按"已发布版本集合"过滤本列，未发布的行就永远不可见。
-    source_data_version = models.CharField(
-        max_length=64, db_index=True, blank=True, default='', verbose_name='数据版本'
-    )
-    source_batch_id = models.CharField(max_length=64, db_index=True, verbose_name='采集批次标识')
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -65,39 +74,3 @@ class KaipanlaSectorFundFlowSnapshot(models.Model):
     def __str__(self):
         local_time = timezone.localtime(self.snapshot_time)
         return f'{self.sector_code} {self.sector_name} @ {local_time:%Y-%m-%d %H:%M}'
-
-
-class KaipanlaSectorFundFlowRun(models.Model):
-    """Detailed local record of one paginated Kaipanla snapshot collection."""
-
-    class Status(models.TextChoices):
-        RUNNING = 'running', '运行中'
-        COMPLETE = 'complete', '完整'
-        FAILED = 'failed', '失败'
-
-    source_batch_id = models.CharField(max_length=64, unique=True, verbose_name='采集批次标识')
-    trade_date = models.DateField(db_index=True, verbose_name='交易日')
-    snapshot_time = models.DateTimeField(db_index=True, verbose_name='快照时间（5分钟对齐）')
-    status = models.CharField(max_length=8, choices=Status.choices, verbose_name='运行状态')
-    expected_page_count = models.PositiveIntegerField(default=0, verbose_name='预计页数')
-    completed_page_count = models.PositiveIntegerField(default=0, verbose_name='完成页数')
-    failed_page_offsets = models.JSONField(default=list, verbose_name='失败页偏移量')
-    expected_record_count = models.PositiveIntegerField(default=0, verbose_name='预计记录数')
-    actual_record_count = models.PositiveIntegerField(default=0, verbose_name='实际记录数')
-    missing_record_count = models.PositiveIntegerField(default=0, verbose_name='缺失记录数')
-    started_at = models.DateTimeField(default=timezone.now, verbose_name='开始时间')
-    finished_at = models.DateTimeField(null=True, blank=True, verbose_name='结束时间')
-    error_summary = models.TextField(blank=True, verbose_name='错误摘要')
-
-    class Meta:
-        indexes = [
-            models.Index(fields=['trade_date', 'snapshot_time']),
-            models.Index(fields=['status', 'started_at']),
-        ]
-        ordering = ['-started_at']
-        verbose_name = '开盘啦板块资金流采集运行'
-        verbose_name_plural = verbose_name
-
-    def __str__(self):
-        local_time = timezone.localtime(self.snapshot_time)
-        return f'{local_time:%Y-%m-%d %H:%M} {self.status}'

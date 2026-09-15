@@ -32,7 +32,30 @@ class ModulesApiTests(SimpleTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(body['status'], 'ok')
         self.assertEqual(body['source'], 'application')
-        self.assertEqual(body['data'], {'healthy': True})
+        self.assertEqual(body['data']['healthy'], True)
+
+    def test_health_carries_the_holiday_table_coverage_contract(self):
+        """覆盖边界是健康检查契约的一部分：跨年退化没有任何别的可见信号。
+
+        这里只钉字段形状，取值由 ``core.tests.test_calendar_services`` 负责——
+        免得升级 ``chinese-calendar`` 时要来改这组断言。
+        """
+        response = self.client.get('/api/core/health/')
+
+        coverage = response.json()['data']['trading_calendar']
+        self.assertEqual(
+            sorted(coverage),
+            [
+                'covered_from',
+                'covered_through',
+                'covered_through_date',
+                'current_year',
+                'current_year_covered',
+                'next_year_covered',
+            ],
+        )
+        self.assertIsInstance(coverage['current_year_covered'], bool)
+        self.assertIsInstance(coverage['next_year_covered'], bool)
 
 
 class DisabledModuleUrlTests(SimpleTestCase):

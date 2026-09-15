@@ -133,13 +133,13 @@ class CommandFailureReportingTests(SimpleTestCase):
 
     def test_the_specific_cause_is_kept_on_the_command_line(self):
         error, rendered = self._fail_with(
-            ValueError('The requested date is not in the trading calendar.')
+            ValueError('The requested date is not a trading day.')
         )
 
         self.assertIn('Stock master synchronization failed.', str(error))
-        self.assertIn('The requested date is not in the trading calendar.', str(error))
+        self.assertIn('The requested date is not a trading day.', str(error))
         self.assertIn('data_command_failed', rendered)
-        self.assertIn('error=The requested date is not in the trading calendar.', rendered)
+        self.assertIn('error=The requested date is not a trading day.', rendered)
 
     def test_a_non_upstream_failure_does_not_claim_an_upstream_error_code(self):
         error, rendered = self._fail_with(ValueError('the calendar is missing'))

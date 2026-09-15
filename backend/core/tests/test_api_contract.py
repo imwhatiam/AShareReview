@@ -1,5 +1,5 @@
 import json
-from datetime import date
+from datetime import UTC, date, datetime
 
 from django.test import SimpleTestCase
 
@@ -11,19 +11,43 @@ class ApiContractTests(SimpleTestCase):
         response = api_success(
             data={'items': []},
             business_date=date(2026, 9, 8),
-            data_version='prices-20260908-v1',
             source='database',
+            data_updated_at=datetime(2026, 9, 8, 7, 35, tzinfo=UTC),
         )
 
         self.assertEqual(response.status_code, 200)
         body = json.loads(response.content)
         self.assertEqual(body['status'], 'ok')
         self.assertEqual(body['business_date'], '2026-09-08')
-        self.assertEqual(body['data_version'], 'prices-20260908-v1')
         self.assertFalse(body['stale'])
         self.assertEqual(body['source'], 'database')
         self.assertEqual(body['preparation']['state'], 'ready')
         self.assertIsNone(body['error'])
+        # 「更新于 HH:MM」读的就是它：**这份数据是什么时候写进库的**，与这次响应是
+        # 几点拼出来的（`generated_at`）无关 —— 结果行落库后一直躺在库里，页面随时
+        # 打开。时区不影响契约：从 ISO 串要能还原成同一个瞬间。
+        self.assertEqual(
+            datetime.fromisoformat(body['data_updated_at']),
+            datetime(2026, 9, 8, 7, 35, tzinfo=UTC),
+        )
+        self.assertNotEqual(body['data_updated_at'], body['generated_at'])
+
+    def test_the_envelope_never_fabricates_a_data_time(self):
+        """没有数据时刻就如实给 null。
+
+        它会退化成"当前时间"的话，空态与刚取回的数据看起来一样新 —— 这正是这次要
+        修掉的东西，所以在这里钉一条。
+        """
+        from core.api.responses import api_success
+
+        body = json.loads(api_success(
+            data=None,
+            business_date=None,
+            source='cache',
+        ).content)
+
+        self.assertIn('data_updated_at', body)
+        self.assertIsNone(body['data_updated_at'])
 
     def test_preparing_error_has_stable_code_and_202_status(self):
         from core.api.errors import ApiError, ErrorCode

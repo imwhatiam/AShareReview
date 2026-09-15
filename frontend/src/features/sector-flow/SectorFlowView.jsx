@@ -30,6 +30,12 @@ function historyRankings(data) {
   }
 }
 
+/*
+ * 取数失败（网络中断 / 5xx）时的文案。它是这个视图自己的文案，不是调用方参数 ——
+ * 原来做成 `errorMessage` prop，4 个调用点传的全是这一句。
+ */
+const LOAD_FAILED_MESSAGE = '开盘啦数据暂时无法加载。'
+
 function makeHistoryChartData(items, rankedSeries) {
   const chronologicalItems = [...items].reverse()
   return {
@@ -47,7 +53,7 @@ function makeHistoryChartData(items, rankedSeries) {
 }
 
 /*
- * 板块资金流视图：按请求钩子和错误提示参数化，供资金流类页面复用。
+ * 板块资金流视图：按请求钩子参数化，供资金流类页面复用。
  * 布局为 控件 → 图表 → 流入/流出双榜单；筛选条件在任何数据状态下都保留，
  * 用户切换日期或统计窗口后即使没有数据，也能直接改回去。
  */
@@ -58,8 +64,8 @@ export default function SectorFlowView({
   days,
   onDateChange,
   onWindowChange,
-  errorMessage,
-  refreshedAt = null,
+  updatedAt = null,
+  onRefresh,
 }) {
   /*
    * 选中的折线集合与三个排行页的展开集合是同一件事（Set 增删），共用一份实现。
@@ -69,7 +75,11 @@ export default function SectorFlowView({
     toggle: toggleSelectedCode,
     replace: replaceSelectedCodes,
   } = useToggleSet()
-  const selectedBusinessDate = useRef(null)
+  /*
+   * 已经据以算过默认勾选的那份响应信封。用**信封对象本身**当闸门，而不是业务日期：
+   * 它每次取数都是一个新对象，正好等于"每取到一份数据就重算一次"。
+   */
+  const selectionSourceEnvelope = useRef(null)
 
   const viewData = useMemo(() => {
     if (!envelope?.data) return null
@@ -89,17 +99,29 @@ export default function SectorFlowView({
     }
   }, [days, envelope])
 
+  /*
+   * 榜单、勾选、折线图是同一份数据的三个视图，必须同进同出 —— 所以**每取到一份新
+   * 数据就把默认勾选重算一次**（刷新、换日期、换统计窗口三条路都带回新信封，一条规则
+   * 覆盖全部）。
+   *
+   * 此前这里用 `business_date` 当闸门：同一天内点「更新于 HH:MM」刷新时一律保留旧
+   * 勾选。旧勾选的板块一旦掉出新榜单，两个榜单的勾选框会全部空着、折线图也一条线都
+   * 不画 —— 用户点刷新看到的是"榜单没刷新好"。换窗口同样会撞上这件事（旧勾选的板块
+   * 可能不在新窗口的榜单里），所以闸门不能只看日期。
+   *
+   * 用信封对象当闸门还顺手挡住了中间态：`days` 已经变了、信封还是上一份时（响应还没
+   * 回来），闸门不成立，不会拿旧信封配新窗口算出一份错的默认勾选。
+   */
   useEffect(() => {
-    const businessDate = envelope?.business_date
-    if (!businessDate || !viewData || selectedBusinessDate.current === businessDate) {
+    if (!envelope || !viewData || selectionSourceEnvelope.current === envelope) {
       return
     }
-    selectedBusinessDate.current = businessDate
+    selectionSourceEnvelope.current = envelope
     replaceSelectedCodes(getDefaultSelectedCodes(
       viewData.rankings.inflows,
       viewData.rankings.outflows,
     ))
-  }, [envelope?.business_date, viewData, replaceSelectedCodes])
+  }, [envelope, viewData, replaceSelectedCodes])
 
   const stateName = resolveDataStateName(phase, envelope, {
     // 图表一条线都画不出来时（窗口内没有数据）也算空态，但控件仍然保留。
@@ -132,13 +154,14 @@ export default function SectorFlowView({
             days={days}
             onDateChange={onDateChange}
             onWindowChange={onWindowChange}
-            refreshedAt={refreshedAt}
+            updatedAt={updatedAt}
+            onRefresh={onRefresh}
           />
 
           {stateName ? (
             <DataState
               state={stateName}
-              message={stateName === 'error' ? errorMessage : undefined}
+              message={stateName === 'error' ? LOAD_FAILED_MESSAGE : undefined}
             />
           ) : (
             <>

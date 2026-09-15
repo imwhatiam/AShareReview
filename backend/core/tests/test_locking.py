@@ -50,7 +50,7 @@ class DatasetLockTests(SimpleTestCase):
     def test_different_datasets_do_not_block_each_other(self):
         with TemporaryDirectory() as directory:
             with dataset_lock('core', 'stock_daily_prices', directory=directory):
-                with dataset_lock('core', 'trading_calendar', directory=directory):
+                with dataset_lock('core', 'stock_master', directory=directory):
                     pass
 
     def test_lock_file_is_removed_after_the_block(self):

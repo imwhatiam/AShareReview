@@ -62,7 +62,6 @@ describe('App shell', () => {
         return jsonResponse({
           status: 'success',
           business_date: '2026-09-09',
-          data_version: 'kaipanla:2026-09-09T15:00:00',
           data: { time_points: [], series: [] },
         })
       }
@@ -103,7 +102,6 @@ describe('App shell', () => {
         return jsonResponse({
           status: 'success',
           business_date: '2026-09-09',
-          data_version: 'kaipanla:2026-09-09T15:00:00',
           data: { time_points: [], series: [] },
         })
       }

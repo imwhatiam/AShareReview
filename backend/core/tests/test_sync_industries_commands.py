@@ -1,4 +1,3 @@
-from datetime import date
 from io import StringIO
 from unittest.mock import patch
 
@@ -6,7 +5,7 @@ from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.test import SimpleTestCase, TestCase
 
-from core.models import DataVersion, IndustrySnapshot, Stock
+from core.models import IndustrySnapshot, Stock
 
 
 class FakeKaipanlaIndustryClient:
@@ -83,12 +82,6 @@ class KaipanlaIndustrySnapshotCommandTests(TestCase):
             IndustrySnapshot.objects.get(industry_code='881270').stock_codes,
             ['000002', '000003'],
         )
-        version = DataVersion.objects.get(dataset_key='industry_snapshot')
-        self.assertEqual(version.status, DataVersion.Status.COMPLETE)
-        # 归属上游实际服务的交易日，而不是运行当天的本地日期。
-        self.assertEqual(version.business_date, date(2026, 9, 11))
-        self.assertEqual(version.expected_record_count, 2)
-        self.assertEqual(version.actual_record_count, 2)
 
     def test_duplicate_industry_codes_abort_the_snapshot(self):
         client = FakeKaipanlaIndustryClient(
@@ -105,7 +98,7 @@ class KaipanlaIndustrySnapshotCommandTests(TestCase):
 
         self.assertEqual(IndustrySnapshot.objects.count(), 0)
 
-    def test_partial_fetch_failure_keeps_previously_published_industry_snapshot(self):
+    def test_partial_fetch_failure_keeps_previously_stored_industry_snapshot(self):
         IndustrySnapshot.objects.create(
             industry_code='OLD',
             industry_name='旧行业',
@@ -124,12 +117,8 @@ class KaipanlaIndustrySnapshotCommandTests(TestCase):
             list(IndustrySnapshot.objects.values_list('industry_code', flat=True)),
             ['OLD'],
         )
-        self.assertEqual(
-            DataVersion.objects.get(dataset_key='industry_snapshot').status,
-            DataVersion.Status.FAILED,
-        )
 
-    def test_dry_run_fetches_snapshot_without_writing_models_or_versions(self):
+    def test_dry_run_fetches_snapshot_without_writing_models(self):
         client = FakeKaipanlaIndustryClient(
             industries=({'industry_code': '881121', 'industry_name': '半导体'},),
             stocks_by_industry={'881121': ('000001',)},
@@ -142,7 +131,6 @@ class KaipanlaIndustrySnapshotCommandTests(TestCase):
         self.assertIn('dry-run', output.getvalue())
         self.assertIn('2026-09-11', output.getvalue())
         self.assertEqual(IndustrySnapshot.objects.count(), 0)
-        self.assertEqual(DataVersion.objects.count(), 0)
 
     def test_success_message_reports_the_trading_day_the_snapshot_belongs_to(self):
         client = FakeKaipanlaIndustryClient(
@@ -156,10 +144,6 @@ class KaipanlaIndustrySnapshotCommandTests(TestCase):
             call_command('sync_kaipanla_industry_snapshot', stdout=output)
 
         self.assertIn('synchronized 1 industry records for 2026-09-11.', output.getvalue())
-        self.assertEqual(
-            DataVersion.objects.get(dataset_key='industry_snapshot').business_date,
-            date(2026, 9, 11),
-        )
 
     def test_industry_without_members_is_persisted_with_an_empty_stock_list(self):
         # 上游可以合法地返回空成分股（实测 801058）；这不该阻断其他行业发布。

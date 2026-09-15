@@ -7,32 +7,25 @@ from time import perf_counter, sleep
 from typing import Any
 
 import requests
-from django.core.exceptions import ImproperlyConfigured
 
-from backend.env import get_required_setting, get_setting
+from backend.env import (
+    get_required_float_setting,
+    get_required_int_setting,
+    get_required_setting,
+    get_setting,
+)
 from core.api.errors import upstream_error_code_value
+from core.integrations.kaipanla.contracts import (
+    KaipanlaPayloadError,
+    KaipanlaRateLimitError,
+    KaipanlaUnavailableError,
+    request_headers,
+)
 from core.logging import elapsed_ms, log_event, redact_sensitive_text
 from core.services.calendar import latest_trading_date
 
 
 logger = logging.getLogger(__name__)
-
-
-class KaipanlaUnavailableError(RuntimeError):
-    """The Kaipanla endpoint rejected or could not complete a request."""
-
-
-class KaipanlaRateLimitError(KaipanlaUnavailableError):
-    """The Kaipanla endpoint refused the request because we are being throttled.
-
-    A subclass on purpose: every existing ``except KaipanlaUnavailableError``
-    keeps working, while the error-code mapping can single out 429 as
-    ``UPSTREAM_RATE_LIMITED``.
-    """
-
-
-class KaipanlaPayloadError(RuntimeError):
-    """The Kaipanla endpoint returned an unusable response shape."""
 
 
 def _upstream_error_detail(error_code: str, error_message) -> str:
@@ -75,30 +68,6 @@ class _ClientSettings:
     stock_is_kzz_type: str
 
 
-def _positive_integer_setting(name: str, *, minimum: int = 0) -> int:
-    value = get_required_setting(name)
-    try:
-        parsed = int(value)
-    except ValueError as error:
-        raise ImproperlyConfigured(f'{name} must be an integer.') from error
-    if parsed < minimum:
-        raise ImproperlyConfigured(f'{name} must be at least {minimum}.')
-    return parsed
-
-
-def _request_delay_setting() -> float:
-    value = get_required_setting('KAIPANLA_REQUEST_DELAY_SECONDS')
-    try:
-        parsed = float(value)
-    except ValueError as error:
-        raise ImproperlyConfigured(
-            'KAIPANLA_REQUEST_DELAY_SECONDS must be numeric.'
-        ) from error
-    if parsed < 0:
-        raise ImproperlyConfigured('KAIPANLA_REQUEST_DELAY_SECONDS must not be negative.')
-    return parsed
-
-
 def _settings() -> _ClientSettings:
     return _ClientSettings(
         endpoint=get_required_setting('KAIPANLA_INDUSTRY_API_URL'),
@@ -108,13 +77,13 @@ def _settings() -> _ClientSettings:
         version=get_required_setting('KPL_VERSION'),
         api_version=get_required_setting('KPL_API_VERSION'),
         phone_os_new=get_required_setting('KPL_PHONE_OS_NEW'),
-        timeout_seconds=_positive_integer_setting('KAIPANLA_TIMEOUT_SECONDS', minimum=1),
-        request_delay_seconds=_request_delay_setting(),
-        max_retries=_positive_integer_setting('KAIPANLA_MAX_RETRIES'),
-        parent_page_size=_positive_integer_setting(
+        timeout_seconds=get_required_int_setting('KAIPANLA_TIMEOUT_SECONDS', minimum=1),
+        request_delay_seconds=get_required_float_setting('KAIPANLA_REQUEST_DELAY_SECONDS'),
+        max_retries=get_required_int_setting('KAIPANLA_MAX_RETRIES'),
+        parent_page_size=get_required_int_setting(
             'KAIPANLA_INDUSTRY_PARENT_PAGE_SIZE', minimum=1
         ),
-        stock_page_size=_positive_integer_setting(
+        stock_page_size=get_required_int_setting(
             'KAIPANLA_INDUSTRY_STOCK_PAGE_SIZE', minimum=1
         ),
         controller=get_required_setting('KAIPANLA_INDUSTRY_CONTROLLER'),
@@ -139,7 +108,7 @@ class KaipanlaIndustryClient:
 
     @property
     def request_date(self) -> str:
-        """The ``Date`` this client sends, exposed for publication metadata."""
+        """The ``Date`` this client sends, exposed for the caller's own use."""
         return self._request_date()
 
     def list_industries(self):
@@ -294,15 +263,7 @@ class KaipanlaIndustryClient:
                     response = self._transport.post(
                         self._settings.endpoint,
                         data=data,
-                        headers={
-                            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                            'User-Agent': (
-                                'Dalvik/2.1.0 (Linux; U; Android 12; '
-                                'ALN-AL00 Build/W528JS)'
-                            ),
-                            'Accept-Encoding': 'gzip',
-                            'Connection': 'Keep-Alive',
-                        },
+                        headers=request_headers(),
                         timeout=self._settings.timeout_seconds,
                     )
                 except requests.RequestException as error:

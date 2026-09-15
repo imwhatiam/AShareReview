@@ -58,7 +58,7 @@ describe('createApiClient', () => {
     controller.abort()
 
     /*
-     * 取消必须原样抛出，**不能**被包成 ApiClientError。`usePolledResource` 区分
+     * 取消必须原样抛出，**不能**被包成 ApiClientError。`useResource` 区分
      * "用户切了日期、上一次请求被主动取消"（什么都不做）和"请求真的失败了"
      * （渲染错误态），靠的就是"它不是 ApiClientError 且 signal 已 aborted"这两点；
      * 包一层会让每次快速切日期都闪一下错误页。

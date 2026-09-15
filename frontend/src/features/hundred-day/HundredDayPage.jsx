@@ -113,7 +113,7 @@ function stateMessage(stateName, envelope) {
 export default function HundredDayPage({ apiClient }) {
   const [date, setDate] = useState('')
   const { values: expanded, toggle: toggleExpanded } = useToggleSet()
-  const { phase, envelope, refreshedAt } = useHundredDay({ apiClient, date })
+  const { phase, envelope, updatedAt, refresh } = useHundredDay({ apiClient, date })
 
   const data = envelope?.data ?? null
   const stateName = resolveDataStateName(phase, envelope, {
@@ -132,7 +132,7 @@ export default function HundredDayPage({ apiClient }) {
       toolbar={(
         <>
           <DatePicker id="hundred-day-date" value={displayDate} onChange={setDate} />
-          <RefreshStamp refreshedAt={refreshedAt} />
+          <RefreshStamp updatedAt={updatedAt} onRefresh={refresh} />
           {/* 三个汇总指标依赖数据，没数据时整组不渲染。 */}
           {totals && (
             <div className="stat-grid">

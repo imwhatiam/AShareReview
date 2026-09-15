@@ -2,6 +2,7 @@ import { fireEvent, render, screen } from '@testing-library/react'
 import { useState } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 
+import { envelope } from '../../test/envelope'
 import SectorFlowView from './SectorFlowView'
 
 /*
@@ -29,12 +30,6 @@ const dailyData = {
   ],
 }
 
-function envelope(data, overrides = {}) {
-  return {
-    status: 'ok', business_date: '2026-09-09', stale: false, warnings: [], data, ...overrides,
-  }
-}
-
 /* 注意必须是稳定引用：默认参数每次渲染都会新建对象，那等于在测"父级换了数据"。 */
 const stableResponse = envelope(dailyData)
 
@@ -52,7 +47,6 @@ function Harness({ response = stableResponse }) {
         days={1}
         onDateChange={() => {}}
         onWindowChange={() => {}}
-        errorMessage="开盘啦数据暂时无法加载。"
       />
     </>
   )
@@ -68,7 +62,6 @@ describe('SectorFlowView', () => {
         days={1}
         onDateChange={() => {}}
         onWindowChange={() => {}}
-        errorMessage="开盘啦数据暂时无法加载。"
       />,
     )
 
@@ -113,7 +106,6 @@ describe('SectorFlowView', () => {
         days={1}
         onDateChange={() => {}}
         onWindowChange={() => {}}
-        errorMessage="开盘啦数据暂时无法加载。"
       />,
     )
 

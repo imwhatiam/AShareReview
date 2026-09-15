@@ -1,7 +1,7 @@
 import { useMemo } from 'react'
 
 import useChart from '../../shared/charts/useChart'
-import { flowOption } from '../../shared/charts/chartTheme'
+import { flowOption } from './flowOption'
 
 export default function IntradayChart({ timePoints, series }) {
   const option = useMemo(

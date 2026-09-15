@@ -15,8 +15,7 @@ from typing import Callable
 from django.views.decorators.http import require_GET
 
 from core.api.errors import ApiError, ErrorCode
-from core.api.responses import api_success
-from core.api.validators import parse_iso_date
+from core.api.handlers import optional_date, require_authenticated, success
 
 
 @dataclass(frozen=True)
@@ -35,27 +34,6 @@ class UnavailableRule:
     absent_code: ErrorCode = ErrorCode.DATA_NOT_AVAILABLE
     preparing_code: ErrorCode = ErrorCode.DATA_PREPARING
     preparation_state: str = 'preparing'
-
-
-def _require_authenticated(request):
-    if not request.user.is_authenticated:
-        raise ApiError(ErrorCode.AUTH_REQUIRED, '请先登录。', http_status=401)
-
-
-def _optional_date(request):
-    value = request.GET.get('date')
-    return None if value is None else parse_iso_date(value)
-
-
-def _success(result):
-    return api_success(
-        data=result.data,
-        business_date=result.business_date,
-        data_version=result.data_version,
-        source=result.source,
-        stale=result.stale,
-        warnings=list(result.warnings),
-    )
 
 
 def build_read_endpoints(
@@ -94,15 +72,15 @@ def build_read_endpoints(
         return _handle(lambda: _results(request), requested_date=requested_date)
 
     def _results(request):
-        _require_authenticated(request)
-        return _success(read_result(_optional_date(request)))
+        require_authenticated(request)
+        return success(read_result(optional_date(request)))
 
     @require_GET
     def dates(request):
         return _handle(lambda: _dates(request))
 
     def _dates(request):
-        _require_authenticated(request)
-        return _success(read_dates())
+        require_authenticated(request)
+        return success(read_dates())
 
     return results, dates

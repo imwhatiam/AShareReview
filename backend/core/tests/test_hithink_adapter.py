@@ -85,27 +85,6 @@ class HithinkAdapterTests(SimpleTestCase):
         })
         self.assertEqual(transport.calls[0]['timeout'], 7)
 
-    def test_list_trading_days_parses_upstream_compact_dates(self):
-        from core.integrations.hithink.client import HithinkClient
-
-        transport = RecordingTransport([
-            FakeResponse(200, {
-                'code': 0,
-                'data': {
-                    'item': [
-                        {'date_ms': 1788796800000, 'date': '20260908'},
-                        {'date_ms': 1788883200000, 'date': '20260909'},
-                    ],
-                },
-            }),
-        ])
-
-        with patch.dict('os.environ', self.settings, clear=False):
-            trading_days = HithinkClient(transport=transport).list_trading_days()
-
-        self.assertEqual(trading_days, (date(2026, 9, 8), date(2026, 9, 9)))
-        self.assertEqual(transport.calls[0]['params'], {})
-
     def test_get_historical_prices_uses_fixed_daily_forward_adjustment(self):
         from core.integrations.hithink.client import HithinkClient
 
@@ -305,11 +284,11 @@ class HithinkAdapterTests(SimpleTestCase):
             with self.assertRaises(HithinkRateLimitError):
                 HithinkClient(transport=RecordingTransport([
                     FakeResponse(429, {'code': 4001, 'data': None}),
-                ])).list_trading_days()
+                ])).list_a_share_tickers(limit=1, offset=0)
             with self.assertRaises(HithinkAuthenticationError):
                 HithinkClient(transport=RecordingTransport([
                     FakeResponse(200, {'code': 2003, 'data': None}),
-                ])).list_trading_days()
+                ])).list_a_share_tickers(limit=1, offset=0)
 
     def test_transport_timeout_is_mapped_to_upstream_unavailable(self):
         from core.integrations.hithink.client import HithinkClient
@@ -319,7 +298,7 @@ class HithinkAdapterTests(SimpleTestCase):
 
         with patch.dict('os.environ', self.settings, clear=False):
             with self.assertRaises(HithinkUnavailableError):
-                HithinkClient(transport=transport).list_trading_days()
+                HithinkClient(transport=transport).list_a_share_tickers(limit=1, offset=0)
 
     def test_list_industry_indices_requests_the_industry_tag_and_strips_the_market_suffix(self):
         from core.integrations.hithink.client import HithinkClient

@@ -2,10 +2,10 @@ from datetime import date
 
 from core.management.base import BaseDataCommand
 from core.logging import log_command_progress
-from core.services.market_data import get_complete_market_snapshot
+from core.services.market_data import get_complete_market_snapshot, resolve_business_date
 from sector_momentum.services.analysis import build_sector_momentum_analysis
-from sector_momentum.services.source_versions import get_complete_industry_snapshot_version
-from sector_momentum.services.writer import record_failed_run, write_sector_momentum_analysis
+from sector_momentum.services.industry_source import require_industry_snapshot
+from sector_momentum.services.writer import write_sector_momentum_analysis
 
 
 class Command(BaseDataCommand):
@@ -16,44 +16,33 @@ class Command(BaseDataCommand):
 
     def add_arguments(self, parser):
         super().add_arguments(parser)
-        parser.add_argument('--date', required=True, type=date.fromisoformat)
+        parser.add_argument(
+            '--date',
+            type=date.fromisoformat,
+            default=None,
+            help=(
+                'Trading day to build; defaults to the newest day that has stored '
+                'public prices — the same anchor the pages read.'
+            ),
+        )
 
     def get_business_date(self, options):
-        return options['date']
+        return resolve_business_date(options['date'])
 
     def run_data_sync(self, options):
-        business_date = options['date']
-        source_daily_price_version = ''
-        source_industry_version = ''
-        try:
-            log_command_progress('sector_momentum', action='loading_snapshot', date=business_date)
-            snapshot = get_complete_market_snapshot(business_date)
-            source_daily_price_version = snapshot.data_version.version
-            if snapshot.data_version.business_date != business_date:
-                raise ValueError('The public daily-price snapshot date does not match --date.')
-            source_industry_version = get_complete_industry_snapshot_version()
-            log_command_progress(
-                'sector_momentum',
-                action='analyzing',
-                date=business_date,
-                industry_version=source_industry_version,
-            )
-            analysis = build_sector_momentum_analysis(snapshot, source_industry_version)
-            log_command_progress(
-                'sector_momentum',
-                action='analyzed',
-                date=business_date,
-                rankings=sum(len(values) for values in analysis.rankings_by_metric.values()),
-            )
-        except Exception as error:
-            if not options['dry_run']:
-                record_failed_run(
-                    business_date=business_date,
-                    error=error,
-                    source_daily_price_version=source_daily_price_version,
-                    source_industry_version=source_industry_version,
-                )
-            raise
+        business_date = self.get_business_date(options)
+        log_command_progress('sector_momentum', action='loading_snapshot', date=business_date)
+        snapshot = get_complete_market_snapshot(business_date)
+        # 行业映射是排行的分组键：没有它就没有板块，也就没有排行可写。
+        require_industry_snapshot()
+        log_command_progress('sector_momentum', action='analyzing', date=business_date)
+        analysis = build_sector_momentum_analysis(snapshot)
+        log_command_progress(
+            'sector_momentum',
+            action='analyzed',
+            date=business_date,
+            rankings=sum(len(values) for values in analysis.rankings_by_metric.values()),
+        )
 
         if options['dry_run']:
             return analysis, None, True
@@ -68,12 +57,13 @@ class Command(BaseDataCommand):
     def format_success_message(self, result, options):
         analysis, write_result, dry_run = result
         ranking_count = sum(len(values) for values in analysis.rankings_by_metric.values())
+        business_date = self.get_business_date(options).isoformat()
         if dry_run:
             return (
                 f'dry-run: would build {ranking_count} sector-momentum rankings '
-                f'for {options["date"].isoformat()}.'
+                f'for {business_date}.'
             )
         return (
             f'built {write_result.record_count} sector-momentum rankings '
-            f'for {options["date"].isoformat()}.'
+            f'for {business_date}.'
         )

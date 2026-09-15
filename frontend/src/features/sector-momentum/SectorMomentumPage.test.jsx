@@ -2,18 +2,13 @@ import { fireEvent, render, screen, within } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 
 import { pickDate } from '../../test/datePicker'
+import { envelope } from '../../test/envelope'
+import { expectRefreshRefetches } from '../../test/refreshStamp'
 import SectorMomentumPage from './SectorMomentumPage'
 
 vi.mock('./MomentumChart', () => ({
   default: ({ rankings }) => <div>动量图：{rankings.map((item) => item.industry_name).join('、')}</div>,
 }))
-
-function envelope(data, overrides = {}) {
-  return {
-    status: 'ok', business_date: '2026-09-09', data_version: 'prices:industries',
-    stale: false, warnings: [], data, ...overrides,
-  }
-}
 
 const ranking = {
   rank: 1, industry_code: 'P01', industry_name: '板块甲', stock_count: 2,
@@ -104,7 +99,7 @@ describe('SectorMomentumPage', () => {
   })
 
   /*
-   * 日期控件在任何数据状态下都必须保持挂载：`usePolledResource` 在 path 变化时
+   * 日期控件在任何数据状态下都必须保持挂载：`useResource` 在 path 变化时
    * 会把 phase 打回 loading，若页面据此整页替换，用户刚在弹层里点完一天，控件就被
    * 卸载重建 —— 弹层、焦点、滚动位置全丢，页面还会先塌成一行提示再弹回来。
    */
@@ -124,4 +119,10 @@ describe('SectorMomentumPage', () => {
     // 成交额依赖数据，没数据时不渲染。
     expect(screen.queryByText(/^全市场成交额：/)).not.toBeInTheDocument()
   })
+
+  it('re-requests the same day when「更新于」is clicked', () =>
+    expectRefreshRefetches(SectorMomentumPage, {
+      payload: results,
+      endpoint: '/api/sector-momentum/',
+    }))
 })

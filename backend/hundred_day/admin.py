@@ -1,61 +1,43 @@
 from django.contrib import admin
 
 from hundred_day.models import (
+    HundredDayBreadth,
     HundredDayIndustrySummary,
-    HundredDayResult,
-    HundredDayRun,
     HundredDayStockFlag,
-    HundredDayTrend,
 )
 
 
-class HundredDayStockFlagInline(admin.TabularInline):
-    model = HundredDayStockFlag
-    extra = 0
-    can_delete = False
-    readonly_fields = (
-        'stock_code', 'stock_name', 'industries', 'is_new_high', 'is_new_low',
-    )
+@admin.register(HundredDayBreadth)
+class HundredDayBreadthAdmin(admin.ModelAdmin):
+    """市场宽度：某次发布下每个交易日的有效股票数与新高/新低数。
 
+    业务日期那一行就是页面上的"当日"，其余行是趋势图上的点。
+    """
 
-class HundredDayIndustrySummaryInline(admin.TabularInline):
-    model = HundredDayIndustrySummary
-    extra = 0
-    can_delete = False
-    readonly_fields = (
-        'industry_code', 'industry_name', 'stock_count', 'new_high_count', 'new_low_count',
-        'new_high_stocks', 'new_low_stocks',
-    )
-
-
-@admin.register(HundredDayResult)
-class HundredDayResultAdmin(admin.ModelAdmin):
     list_display = (
-        'business_date', 'source_daily_price_version', 'source_industry_version',
-        'valid_stock_count', 'new_high_count', 'new_low_count',
+        'business_date', 'trade_date', 'valid_stock_count', 'new_high_count',
+        'new_low_count', 'published_at',
     )
     list_filter = ('business_date',)
-    search_fields = ('source_daily_price_version', 'source_industry_version')
-    inlines = (HundredDayStockFlagInline, HundredDayIndustrySummaryInline)
+    ordering = ('-business_date', 'trade_date')
 
 
-@admin.register(HundredDayTrend)
-class HundredDayTrendAdmin(admin.ModelAdmin):
+@admin.register(HundredDayStockFlag)
+class HundredDayStockFlagAdmin(admin.ModelAdmin):
     list_display = (
-        'result', 'trade_date', 'valid_stock_count', 'new_high_count', 'new_low_count',
-        'new_high_ratio', 'new_low_ratio',
+        'business_date', 'stock_code', 'stock_name', 'is_new_high', 'is_new_low',
+        'change_percent', 'turnover',
     )
-    list_filter = ('trade_date',)
+    list_filter = ('business_date', 'is_new_high', 'is_new_low')
+    search_fields = ('stock_code', 'stock_name')
+    ordering = ('-business_date', 'stock_code')
 
 
-@admin.register(HundredDayRun)
-class HundredDayRunAdmin(admin.ModelAdmin):
-    list_display = (
-        'source_batch_id', 'business_date', 'status', 'source_daily_price_version',
-        'source_industry_version', 'valid_stock_count', 'started_at', 'finished_at',
-    )
-    list_filter = ('status', 'business_date')
-    search_fields = (
-        'source_batch_id', 'source_daily_price_version', 'source_industry_version',
-        'error_summary',
-    )
+@admin.register(HundredDayIndustrySummary)
+class HundredDayIndustrySummaryAdmin(admin.ModelAdmin):
+    """行业级只留成分股数：新高/新低数量由个股标志现算（见 services/read_path.py）。"""
+
+    list_display = ('business_date', 'industry_code', 'industry_name', 'stock_count')
+    list_filter = ('business_date',)
+    search_fields = ('industry_code', 'industry_name')
+    ordering = ('-business_date', 'industry_code')

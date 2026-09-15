@@ -1,10 +1,11 @@
-"""Intraday whole-market snapshot refresh: paging, conventions, publication."""
+"""Intraday whole-market snapshot refresh: paging, conventions, gating, writing."""
 
 import os
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from io import StringIO
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from django.core.management import call_command
 from django.core.management.base import CommandError
@@ -14,8 +15,14 @@ from core.integrations.hithink.contracts import (
     HithinkQuoteSnapshot,
     HithinkUnavailableError,
 )
-from core.models import DailyPrice, DataVersion, Stock, TradingDay
+from core.management.commands.refresh_intraday_quotes import Command
+from core.models import DailyPrice, Stock
 from core.services.sync_daily_prices import refresh_intraday_daily_prices
+
+
+_SHANGHAI = ZoneInfo('Asia/Shanghai')
+# 闸门用例里的"非交易日"：2026-09-12 是周六。
+_NON_TRADING_DAY = date(2026, 9, 12)
 
 
 class FakeSnapshotClient:
@@ -66,8 +73,6 @@ class IntradayQuoteRefreshTests(TestCase):
     def setUp(self):
         self.previous_day = date(2026, 9, 10)
         self.day = date(2026, 9, 11)
-        TradingDay.objects.create(trade_date=self.previous_day)
-        TradingDay.objects.create(trade_date=self.day)
         self.stock = Stock.objects.create(
             thscode='000001.SZ',
             stock_code='000001',
@@ -89,14 +94,30 @@ class IntradayQuoteRefreshTests(TestCase):
             close_price=Decimal(close),
             has_valid_trade=True,
             source_batch_id='previous-batch',
-            source_data_version='previous-version',
         )
+
+    def _day_rows(self) -> dict[str, tuple]:
+        """Snapshot the refreshed day keyed by stock code, batch identity included."""
+        return {
+            row.stock.stock_code: (
+                row.pre_close,
+                row.close_price,
+                row.change_percent,
+                row.has_valid_trade,
+                row.source_batch_id,
+            )
+            for row in DailyPrice.objects.filter(trade_date=self.day).select_related('stock')
+        }
 
     def _both_quotes(self, *, first='11.0', second='22.0'):
         return (
             _quote(self.stock.thscode, self.stock.stock_code, first),
             _quote(self.other.thscode, self.other.stock_code, second),
         )
+
+    def _at(self, day, hour, minute=0):
+        """A Shanghai wall clock, used to pin the command's gate and business date."""
+        return datetime(day.year, day.month, day.day, hour, minute, tzinfo=_SHANGHAI)
 
     def _refresh(self, client, **kwargs):
         with patch(
@@ -107,7 +128,7 @@ class IntradayQuoteRefreshTests(TestCase):
                 trade_date=self.day, client=client, **kwargs
             )
 
-    def test_refresh_publishes_one_complete_version_covering_the_whole_market(self):
+    def test_refresh_writes_one_batch_covering_the_whole_market(self):
         self._store_previous_close(self.stock, '10.0')
         self._store_previous_close(self.other, '20.0')
 
@@ -116,26 +137,18 @@ class IntradayQuoteRefreshTests(TestCase):
         self.assertTrue(result.published)
         self.assertEqual(result.matched_stock_count, 2)
         self.assertEqual(result.coverage_ratio, Decimal('1'))
+        self.assertEqual(result.changed_record_count, 2)
+        self.assertEqual(result.unchanged_record_count, 0)
         row = DailyPrice.objects.get(stock=self.stock, trade_date=self.day)
         self.assertEqual(row.close_price, Decimal('11.0000'))
         self.assertEqual(row.pre_close, Decimal('10.0000'))
         self.assertEqual(row.change_percent, Decimal('10.000000'))
         self.assertTrue(row.has_valid_trade)
-        version = DataVersion.objects.get(
-            dataset_key='stock_daily_prices',
-            business_date=self.day,
-            status=DataVersion.Status.COMPLETE,
-        )
-        self.assertEqual(version.expected_record_count, 2)
-        self.assertEqual(version.actual_record_count, 2)
-        self.assertEqual(
-            set(
-                DailyPrice.objects.filter(trade_date=self.day).values_list(
-                    'source_data_version', flat=True
-                )
-            ),
-            {version.version},
-        )
+        # 一次刷新就是一个批次：当天两行由同一批次写下 —— 版本表删掉之后，
+        # source_batch_id 是"这批数据一起写进来的"唯一凭证。
+        batches = {values[4] for values in self._day_rows().values()}
+        self.assertEqual(len(batches), 1)
+        self.assertNotIn('previous-batch', batches)
 
     def test_refresh_walks_every_snapshot_page(self):
         self._store_previous_close(self.stock, '10.0')
@@ -156,7 +169,6 @@ class IntradayQuoteRefreshTests(TestCase):
             close_price=Decimal('10.5'),
             has_valid_trade=True,
             source_batch_id='intraday-batch',
-            source_data_version='intraday-version',
         )
 
         self._refresh(FakeSnapshotClient(self._both_quotes()))
@@ -164,7 +176,8 @@ class IntradayQuoteRefreshTests(TestCase):
         self.assertEqual(DailyPrice.objects.filter(trade_date=self.day).count(), 2)
         row = DailyPrice.objects.get(stock=self.stock, trade_date=self.day)
         self.assertEqual(row.close_price, Decimal('11.0000'))
-        self.assertNotEqual(row.source_data_version, 'intraday-version')
+        # 行被改写，但批次身份不重盖：它回答"这行从哪来"，不是"最近什么时候跑过"。
+        self.assertEqual(row.source_batch_id, 'intraday-batch')
 
     def test_refresh_records_a_suspended_stock_as_a_non_trading_record(self):
         self._store_previous_close(self.stock, '10.0')
@@ -210,23 +223,19 @@ class IntradayQuoteRefreshTests(TestCase):
         self.assertTrue(row.has_valid_trade)
         self.assertEqual(row.close_price, Decimal('11.0000'))
 
-    def test_refresh_publishes_nothing_when_the_snapshot_has_not_moved(self):
+    def test_refresh_writes_nothing_when_the_snapshot_has_not_moved(self):
         self._store_previous_close(self.stock, '10.0')
         self._store_previous_close(self.other, '20.0')
         quotes = self._both_quotes()
         self._refresh(FakeSnapshotClient(quotes))
-        versions_before = DataVersion.objects.count()
-        staging_before = set(DailyPrice.objects.values_list('source_batch_id', flat=True))
+        rows_before = self._day_rows()
 
         result = self._refresh(FakeSnapshotClient(quotes))
 
         self.assertFalse(result.published)
         self.assertTrue(result.is_up_to_date)
-        self.assertEqual(DataVersion.objects.count(), versions_before)
-        self.assertEqual(
-            set(DailyPrice.objects.values_list('source_batch_id', flat=True)),
-            staging_before,
-        )
+        self.assertEqual(result.changed_record_count, 0)
+        self.assertEqual(self._day_rows(), rows_before)
 
     def test_refresh_rejects_a_truncated_snapshot_without_writing_anything(self):
         self._store_previous_close(self.stock, '10.0')
@@ -239,10 +248,7 @@ class IntradayQuoteRefreshTests(TestCase):
             with self.assertRaises(ValueError):
                 self._refresh(client)
 
-        self.assertFalse(DailyPrice.objects.filter(trade_date=self.day).exists())
-        self.assertFalse(
-            DataVersion.objects.filter(business_date=self.day).exists()
-        )
+        self.assertEqual(self._day_rows(), {})
 
     def test_refresh_skips_quotes_that_are_not_in_the_stock_master(self):
         """快照里有、本地股票表里没有的代码不能凭空建行。"""
@@ -265,12 +271,9 @@ class IntradayQuoteRefreshTests(TestCase):
         self.assertTrue(result.dry_run)
         self.assertFalse(result.published)
         self.assertEqual(result.changed_record_count, 2)
-        self.assertFalse(DailyPrice.objects.filter(trade_date=self.day).exists())
-        self.assertFalse(
-            DataVersion.objects.filter(business_date=self.day).exists()
-        )
+        self.assertEqual(self._day_rows(), {})
 
-    def test_refresh_rejects_a_date_outside_the_trading_calendar(self):
+    def test_refresh_rejects_a_non_trading_day(self):
         client = FakeSnapshotClient(self._both_quotes())
 
         with self.assertRaises(ValueError):
@@ -279,6 +282,19 @@ class IntradayQuoteRefreshTests(TestCase):
             )
 
         self.assertEqual(client.calls, [])
+
+    def test_the_command_has_no_date_option(self):
+        """日期不可指定：快照端点没有日期参数，它永远回答"此刻"。
+
+        留着 ``--date`` 就等于留着一个能把今天的行情写到别的日期上的入口 ——
+        业务日期恒为上海时区的今天，由 ``_now()`` 同时供业务日期和时段闸门使用。
+        """
+        parser = Command().create_parser('manage.py', 'refresh_intraday_quotes')
+
+        self.assertEqual(
+            {action.dest for action in parser._actions} & {'date', 'latest'},
+            {'latest'},
+        )
 
     def test_refresh_command_reports_the_refreshed_record_count(self):
         self._store_previous_close(self.stock, '10.0')
@@ -291,42 +307,129 @@ class IntradayQuoteRefreshTests(TestCase):
                 'core.services.sync_daily_prices._intraday_quote_page_size',
                 return_value=2,
             ),
+            patch(
+                'core.management.commands.refresh_intraday_quotes._now',
+                return_value=self._at(self.day, 10, 0),
+            ),
         ):
             output = StringIO()
-            call_command(
-                'refresh_intraday_quotes',
-                '--date',
-                self.day.isoformat(),
-                stdout=output,
-            )
+            call_command('refresh_intraday_quotes', stdout=output)
 
         self.assertIn(
             f'refreshed 2 intraday records (0 unchanged) for {self.day.isoformat()}',
             output.getvalue(),
         )
 
-    def test_refresh_command_falls_back_to_today_and_rejects_it_when_closed(self):
-        """默认日期是今天的上海日期；非交易日必须失败而不是写别的日期。"""
-        with patch(
-            'core.management.commands.refresh_intraday_quotes._today',
-            return_value=date(2026, 9, 12),
-        ):
-            with self.assertRaises(CommandError):
-                call_command('refresh_intraday_quotes')
+    def test_refresh_command_skips_a_non_trading_day_even_with_latest(self):
+        """休市日连 --latest 也不取数：快照只会回答上一交易日的收盘态。
 
-        self.assertFalse(
-            DataVersion.objects.filter(business_date=date(2026, 9, 12)).exists()
-        )
+        这与 ``fetch_kaipanla_sector_fund_flow`` 刻意不同 —— 那条命令的 ``--latest``
+        允许在非交易日强制采集，因为它采的是"最近一个交易日的收盘快照"这个明确的
+        概念；而这里没有日期可以落，写下去就是把旧数据冒充成今天。
+        """
+        client = FakeSnapshotClient(self._both_quotes())
 
-    def test_refresh_reports_upstream_failure_as_a_command_error(self):
+        for extra in ((), ('--latest',)):
+            with self.subTest(args=extra):
+                with (
+                    patch(
+                        'core.services.sync_daily_prices.HithinkClient',
+                        return_value=client,
+                    ),
+                    patch(
+                        'core.management.commands.refresh_intraday_quotes._now',
+                        return_value=self._at(_NON_TRADING_DAY, 16, 0),
+                    ),
+                ):
+                    output = StringIO()
+                    call_command('refresh_intraday_quotes', *extra, stdout=output)
+
+                rendered = output.getvalue()
+                self.assertIn('skipped:', rendered)
+                self.assertIn('is not a trading day', rendered)
+
+        self.assertEqual(client.calls, [])
+        self.assertFalse(DailyPrice.objects.filter(trade_date=_NON_TRADING_DAY).exists())
+
+    def test_refresh_command_skips_outside_the_session_unless_latest_is_passed(self):
         self._store_previous_close(self.stock, '10.0')
         self._store_previous_close(self.other, '20.0')
+        client = FakeSnapshotClient(self._both_quotes())
+        closed = self._at(self.day, 16, 0)
+
+        with (
+            patch('core.services.sync_daily_prices.HithinkClient', return_value=client),
+            patch(
+                'core.services.sync_daily_prices._intraday_quote_page_size',
+                return_value=2,
+            ),
+            patch(
+                'core.management.commands.refresh_intraday_quotes._now',
+                return_value=closed,
+            ),
+        ):
+            output = StringIO()
+            call_command('refresh_intraday_quotes', stdout=output)
+
+            self.assertIn('skipped:', output.getvalue())
+            self.assertEqual(client.calls, [])
+            self.assertEqual(self._day_rows(), {})
+
+            output = StringIO()
+            call_command('refresh_intraday_quotes', '--latest', stdout=output)
+
+        self.assertIn('refreshed 2 intraday records', output.getvalue())
+        self.assertEqual(len(self._day_rows()), 2)
+
+    def test_refresh_command_targets_today_in_shanghai(self):
+        """业务日期来自命令自己的时钟，而不是运行环境的时区。"""
+        self._store_previous_close(self.stock, '10.0')
+        self._store_previous_close(self.other, '20.0')
+        client = FakeSnapshotClient(self._both_quotes())
+
+        with (
+            patch('core.services.sync_daily_prices.HithinkClient', return_value=client),
+            patch(
+                'core.services.sync_daily_prices._intraday_quote_page_size',
+                return_value=2,
+            ),
+            patch(
+                'core.management.commands.refresh_intraday_quotes._now',
+                return_value=self._at(self.day, 9, 30),
+            ),
+        ):
+            call_command('refresh_intraday_quotes')
+
+        self.assertEqual(
+            DailyPrice.objects.filter(trade_date=self.day).count(), 2
+        )
+
+    def test_refresh_reports_upstream_failure_as_a_command_error_and_keeps_the_day(self):
+        self._store_previous_close(self.stock, '10.0')
+        self._store_previous_close(self.other, '20.0')
+        DailyPrice.objects.create(
+            stock=self.stock,
+            trade_date=self.day,
+            close_price=Decimal('10.5'),
+            has_valid_trade=True,
+            source_batch_id='intraday-batch',
+        )
+        before = self._day_rows()
         client = FakeSnapshotClient(error=HithinkUnavailableError('down'))
 
-        with patch('core.services.sync_daily_prices.HithinkClient', return_value=client):
-            with self.assertRaises(CommandError):
-                call_command(
-                    'refresh_intraday_quotes', '--date', self.day.isoformat()
-                )
+        with (
+            patch('core.services.sync_daily_prices.HithinkClient', return_value=client),
+            patch(
+                'core.management.commands.refresh_intraday_quotes._now',
+                return_value=self._at(self.day, 10, 0),
+            ),
+            self.assertLogs('core.management', level='ERROR') as captured,
+            self.assertRaises(CommandError),
+        ):
+            call_command('refresh_intraday_quotes')
 
-        self.assertFalse(DailyPrice.objects.filter(trade_date=self.day).exists())
+        # 失败只留日志，当天已有的行一行都不动。
+        self.assertEqual(self._day_rows(), before)
+        logged = '\n'.join(captured.output)
+        self.assertIn('data_command_failed', logged)
+        self.assertIn('dataset=stock_daily_prices', logged)

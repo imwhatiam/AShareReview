@@ -1,42 +1,25 @@
 from django.contrib import admin
 
-from sector_momentum.models import (
-    SectorMomentumRanking,
-    SectorMomentumResult,
-    SectorMomentumRun,
-)
+from sector_momentum.models import SectorMomentumRanking
 
 
-class SectorMomentumRankingInline(admin.TabularInline):
-    model = SectorMomentumRanking
-    extra = 0
-    can_delete = False
-    readonly_fields = (
-        'metric', 'rank', 'industry_code', 'industry_name', 'stock_count',
-        'average_change_percent', 'industry_turnover', 'market_turnover_ratio',
-        'score', 'stocks',
-    )
+@admin.register(SectorMomentumRanking)
+class SectorMomentumRankingAdmin(admin.ModelAdmin):
+    """单表后台：这一天每个口径下有哪些行业、各自入选了哪些股票。
 
+    名次与评分不在列表里列，它们由 ``stocks`` 现算（见
+    ``services/read_path.py``），列出来只是同一个事实的第二份副本。
+    """
 
-@admin.register(SectorMomentumResult)
-class SectorMomentumResultAdmin(admin.ModelAdmin):
     list_display = (
-        'business_date', 'source_daily_price_version', 'source_industry_version',
-        'total_market_turnover', 'unmapped_stock_count',
+        'business_date',
+        'metric',
+        'industry_code',
+        'industry_name',
+        'total_market_turnover',
+        'unmapped_stock_count',
+        'published_at',
     )
-    list_filter = ('business_date',)
-    search_fields = ('source_daily_price_version', 'source_industry_version')
-    inlines = (SectorMomentumRankingInline,)
-
-
-@admin.register(SectorMomentumRun)
-class SectorMomentumRunAdmin(admin.ModelAdmin):
-    list_display = (
-        'source_batch_id', 'business_date', 'status', 'source_daily_price_version',
-        'source_industry_version', 'unmapped_stock_count', 'started_at', 'finished_at',
-    )
-    list_filter = ('status', 'business_date')
-    search_fields = (
-        'source_batch_id', 'source_daily_price_version', 'source_industry_version',
-        'error_summary',
-    )
+    list_filter = ('business_date', 'metric')
+    search_fields = ('industry_code', 'industry_name')
+    ordering = ('-business_date', 'metric', 'industry_code')

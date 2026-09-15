@@ -1,6 +1,6 @@
 import useDateResource from '../../shared/useDateResource'
 
-export const HUNDRED_DAY_ENDPOINT = '/api/hundred-day/'
+const HUNDRED_DAY_ENDPOINT = '/api/hundred-day/'
 
 /*
  * 这三个错误码都要带正文渲染，而不是打成"加载失败"：
@@ -10,7 +10,7 @@ export const HUNDRED_DAY_ENDPOINT = '/api/hundred-day/'
  * - SYNC_IN_PROGRESS：该日期的分析正被另一轮生成占用且连旧结果都没有（409），
  *   是可重试的"稍后会有"，页面按 preparation.state=syncing 显示"数据准备中"。
  */
-export const HUNDRED_DAY_ENVELOPE_ERROR_CODES = [
+const HUNDRED_DAY_ENVELOPE_ERROR_CODES = [
   'DATA_NOT_AVAILABLE', 'INSUFFICIENT_HISTORY', 'SYNC_IN_PROGRESS',
 ]
 

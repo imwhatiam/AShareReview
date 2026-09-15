@@ -17,13 +17,6 @@ class Stock(models.Model):
         ordering = ['stock_code']
 
 
-class TradingDay(models.Model):
-    trade_date = models.DateField(unique=True)
-
-    class Meta:
-        ordering = ['trade_date']
-
-
 class IndustrySnapshot(models.Model):
     industry_code = models.CharField(max_length=32, unique=True)
     industry_name = models.CharField(max_length=64)

@@ -4,16 +4,12 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
+from django.db import transaction
+
 from core.integrations.kaipanla.client import KaipanlaIndustryClient
 from core.logging import ProgressReporter, log_command_progress
 from core.models import IndustrySnapshot
 from core.services.industry_backfill import backfill_missing_industry_stocks
-from core.services.publication import (
-    begin_publication,
-    fail_publication,
-    publish_with_writer,
-    set_publication_details,
-)
 
 _DATASET_KEY = 'industry_snapshot'
 
@@ -83,40 +79,27 @@ def _collect_industry_snapshot(client: KaipanlaIndustryClient) -> tuple[dict[str
 
 
 def sync_kaipanla_industry_snapshot(*, dry_run: bool = False) -> IndustrySnapshotSyncResult:
+    """Replace the industry mapping in one transaction, after the whole chain is fetched.
+
+    上游历史接口只服务交易日，所以 `business_date` 取该交易日而不是本地日期：
+    周末或节假日运行时两者不同，用本地日期会让报告里那个日期看起来是新的、实际不是。
+    """
     client = KaipanlaIndustryClient()
-    # 上游历史接口只服务交易日，所以数据集归属该交易日，而不是本地日期：
-    # 周末或节假日运行时两者不同，用本地日期会让版本看起来很新、实际不是。
     business_date = date.fromisoformat(client.request_date)
+    records = _collect_industry_snapshot(client)
+    # 上游历史接口给不出北交所成分股，这里用同花顺补齐；补全失败要整体失败，
+    # 否则会安静地退回"313 只有效股票未映射"那个状态。
+    backfilled_stock_count = backfill_missing_industry_stocks(records)
     if dry_run:
-        records = _collect_industry_snapshot(client)
-        backfilled_stock_count = backfill_missing_industry_stocks(records)
         return IndustrySnapshotSyncResult(
             _DATASET_KEY, len(records), True, business_date, backfilled_stock_count
         )
 
-    run = begin_publication('core', _DATASET_KEY, None, 0)
-    try:
-        records = _collect_industry_snapshot(client)
-        # 上游历史接口给不出北交所成分股，这里用同花顺补齐；补全失败要整体失败，
-        # 否则会安静地退回"313 只有效股票未映射"那个状态。
-        backfilled_stock_count = backfill_missing_industry_stocks(records)
-        run = set_publication_details(run, len(records), business_date)
-    except Exception as error:
-        fail_publication(run, error)
-        raise
-
-    def write_records():
+    with transaction.atomic():
         IndustrySnapshot.objects.all().delete()
         IndustrySnapshot.objects.bulk_create(
             [IndustrySnapshot(**record) for record in records]
         )
-
-    publish_with_writer(
-        run,
-        write_records,
-        actual_record_count=len(records),
-        missing_record_count=0,
-    )
     return IndustrySnapshotSyncResult(
         _DATASET_KEY, len(records), False, business_date, backfilled_stock_count
     )

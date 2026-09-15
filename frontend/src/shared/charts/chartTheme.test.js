@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
+import { ANIMATION_DURATION_MS } from './chartBaseline'
 import {
-  flowOption,
   MOMENTUM_BARS,
   momentumOption,
   scoreAxisMax,
@@ -160,19 +160,21 @@ describe('trendOption', () => {
 })
 
 /*
- * 四张业务图共用同一个入场动画时长。这里只断"三者一致"，不断 320 这个字面值 ——
- * 时长本身可以调，但调的时候必须三张图一起调，否则切日期能看出快慢差异。
+ * 四张业务图共用同一个入场动画时长（资金流那两张由
+ * `features/sector-flow/flowOption.test.js` 钉住）。断的是"都取自
+ * `chartBaseline.ANIMATION_DURATION_MS`"而不是 320 这个字面值 —— 时长本身可以调，
+ * 但调的时候必须几张图一起调，漂移才是 bug。
  */
 describe('chart entrance animation', () => {
-  it('gives all three option builders the same duration', () => {
+  it('takes the entrance animation from the shared baseline', () => {
     const options = [
       momentumOption({ rankings }),
       trendOption({ dates: ['2026-09-08'], newHighRatioSeries: [12.5], newLowRatioSeries: [0] }),
-      flowOption({ timePoints: ['09:30'], series: [] }),
     ]
 
-    const durations = options.map((option) => option.animationDuration)
-    expect(durations.every((value) => Number.isFinite(value) && value > 0)).toBe(true)
-    expect(new Set(durations).size).toBe(1)
+    expect(options.map((option) => option.animationDuration)).toEqual([
+      ANIMATION_DURATION_MS,
+      ANIMATION_DURATION_MS,
+    ])
   })
 })

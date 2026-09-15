@@ -1,4 +1,3 @@
-from datetime import date
 from io import StringIO
 from unittest.mock import patch
 
@@ -7,13 +6,12 @@ from django.core.management.base import CommandError
 from django.test import TestCase
 
 from core.integrations.hithink.contracts import HithinkTicker, HithinkUnavailableError
-from core.models import DataVersion, Stock, TradingDay
+from core.models import Stock
 
 
 class FakeHithinkClient:
-    def __init__(self, ticker_pages=(), trading_days=(), error=None):
+    def __init__(self, ticker_pages=(), error=None):
         self.ticker_pages = list(ticker_pages)
-        self.trading_days = trading_days
         self.error = error
         self.offsets = []
 
@@ -23,14 +21,16 @@ class FakeHithinkClient:
             raise self.error
         return self.ticker_pages.pop(0) if self.ticker_pages else ()
 
-    def list_trading_days(self):
-        if self.error:
-            raise self.error
-        return self.trading_days
-
 
 class ReferenceSyncCommandTests(TestCase):
-    def test_stock_master_command_upserts_all_pages_and_publishes_complete_version(self):
+    """股票主数据同步：一次运行 = 一个事务。
+
+    以前"这次同步成功了吗"由 ``DataVersion`` 与 ``ModuleRunStatus`` 两张表回答；
+    现在只有两种可观察结果 —— 库里的行被整体替换，或者一行都没动。所以这里断言
+    的重点从"版本行写了什么状态"变成了"失败之后旧数据是否原样还在"。
+    """
+
+    def test_stock_master_command_upserts_all_pages(self):
         client = FakeHithinkClient(ticker_pages=[
             (
                 HithinkTicker('000001.SZ', '000001', '平安银行', 'szse'),
@@ -45,12 +45,8 @@ class ReferenceSyncCommandTests(TestCase):
         self.assertEqual(client.offsets, [0, 2])
         self.assertEqual(Stock.objects.count(), 2)
         self.assertEqual(Stock.objects.get(stock_code='000001').exchange, 'szse')
-        version = DataVersion.objects.get(dataset_key='stock_master')
-        self.assertEqual(version.status, DataVersion.Status.COMPLETE)
-        self.assertEqual(version.expected_record_count, 2)
-        self.assertEqual(version.actual_record_count, 2)
 
-    def test_stock_master_dry_run_does_not_write_models_or_versions(self):
+    def test_stock_master_dry_run_does_not_write_anything(self):
         client = FakeHithinkClient(ticker_pages=[
             (HithinkTicker('000001.SZ', '000001', '平安银行', 'szse'),),
             (),
@@ -62,9 +58,8 @@ class ReferenceSyncCommandTests(TestCase):
 
         self.assertIn('dry-run', output.getvalue())
         self.assertEqual(Stock.objects.count(), 0)
-        self.assertEqual(DataVersion.objects.count(), 0)
 
-    def test_failed_stock_master_sync_keeps_previously_published_data(self):
+    def test_failed_stock_master_sync_keeps_previously_stored_data(self):
         Stock.objects.create(
             thscode='000001.SZ',
             stock_code='000001',
@@ -79,10 +74,6 @@ class ReferenceSyncCommandTests(TestCase):
 
         stock = Stock.objects.get(stock_code='000001')
         self.assertEqual(stock.stock_name, '旧名称')
-        self.assertEqual(
-            DataVersion.objects.get(dataset_key='stock_master').status,
-            DataVersion.Status.FAILED,
-        )
 
     def test_truncated_stock_master_list_is_rejected_without_deactivating_anything(self):
         """上游少返回若干页时，绝不能把没出现的股票静默停用（P0-2）。"""
@@ -104,10 +95,6 @@ class ReferenceSyncCommandTests(TestCase):
                 call_command('sync_stock_master', '--limit', '5')
 
         self.assertEqual(Stock.objects.filter(is_active=True).count(), 10)
-        self.assertEqual(
-            DataVersion.objects.get(dataset_key='stock_master').status,
-            DataVersion.Status.FAILED,
-        )
 
     def test_stock_master_sync_tolerates_a_normal_deviation(self):
         """小幅波动（0.9 阈值内）照常写入：真退市是允许的。"""
@@ -146,42 +133,3 @@ class ReferenceSyncCommandTests(TestCase):
                 call_command('sync_stock_master', '--dry-run', '--limit', '5')
 
         self.assertEqual(Stock.objects.filter(is_active=True).count(), 10)
-        self.assertEqual(DataVersion.objects.count(), 0)
-
-    def test_trading_calendar_command_replaces_the_recent_window_atomically(self):
-        TradingDay.objects.create(trade_date=date(2025, 9, 8))
-        client = FakeHithinkClient(trading_days=(
-            date(2026, 9, 7),
-            date(2026, 9, 8),
-        ))
-
-        with patch('core.services.sync_reference.HithinkClient', return_value=client):
-            call_command('sync_trading_calendar')
-
-        self.assertEqual(
-            list(TradingDay.objects.values_list('trade_date', flat=True)),
-            [date(2026, 9, 7), date(2026, 9, 8)],
-        )
-        version = DataVersion.objects.get(dataset_key='trading_calendar')
-        self.assertEqual(version.status, DataVersion.Status.COMPLETE)
-        self.assertEqual(version.business_date, date(2026, 9, 8))
-
-    def test_invalid_trading_calendar_order_is_rejected_without_replacing_data(self):
-        TradingDay.objects.create(trade_date=date(2026, 9, 7))
-        client = FakeHithinkClient(trading_days=(
-            date(2026, 9, 8),
-            date(2026, 9, 7),
-        ))
-
-        with patch('core.services.sync_reference.HithinkClient', return_value=client):
-            with self.assertRaises(CommandError):
-                call_command('sync_trading_calendar')
-
-        self.assertEqual(
-            list(TradingDay.objects.values_list('trade_date', flat=True)),
-            [date(2026, 9, 7)],
-        )
-        self.assertEqual(
-            DataVersion.objects.get(dataset_key='trading_calendar').status,
-            DataVersion.Status.FAILED,
-        )

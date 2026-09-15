@@ -83,20 +83,6 @@ def map_ticker(item: dict) -> HithinkTicker:
     )
 
 
-def map_trading_day(item: dict):
-    if not isinstance(item, dict):
-        raise HithinkPayloadError('Upstream trading-day item is invalid.')
-    compact_date = _required_string(item, 'date')
-    timestamp_date = _date_from_milliseconds(_required_integer(item, 'date_ms'))
-    try:
-        parsed_date = datetime.strptime(compact_date, '%Y%m%d').date()
-    except ValueError as error:
-        raise HithinkPayloadError('Upstream trading-day date is invalid.') from error
-    if parsed_date != timestamp_date:
-        raise HithinkPayloadError('Upstream trading-day fields disagree.')
-    return parsed_date
-
-
 def map_price_bar(item: dict) -> HithinkPriceBar:
     if not isinstance(item, dict):
         raise HithinkPayloadError('Upstream historical price item is invalid.')

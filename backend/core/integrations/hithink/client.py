@@ -8,9 +8,8 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import requests
-from django.core.exceptions import ImproperlyConfigured
 
-from backend.env import get_required_setting
+from backend.env import get_required_float_setting, get_required_int_setting, get_required_setting
 from core.api.errors import upstream_error_code_value
 from core.integrations.hithink.contracts import (
     HithinkAuthenticationError,
@@ -24,7 +23,6 @@ from core.integrations.hithink.mappers import (
     map_price_bar,
     map_quote_snapshot,
     map_ticker,
-    map_trading_day,
 )
 from core.logging import elapsed_ms, log_event
 
@@ -45,37 +43,13 @@ class _ClientSettings:
     max_retries: int
 
 
-def _positive_integer_setting(name: str, *, minimum: int = 0) -> int:
-    value = get_required_setting(name)
-    try:
-        parsed = int(value)
-    except ValueError as error:
-        raise ImproperlyConfigured(f'{name} must be an integer.') from error
-    if parsed < minimum:
-        raise ImproperlyConfigured(f'{name} must be at least {minimum}.')
-    return parsed
-
-
 def _settings() -> _ClientSettings:
-    delay = get_required_setting('HITHINK_FINANCE_REQUEST_DELAY_SECONDS')
-    try:
-        request_delay_seconds = float(delay)
-    except ValueError as error:
-        raise ImproperlyConfigured(
-            'HITHINK_FINANCE_REQUEST_DELAY_SECONDS must be numeric.'
-        ) from error
-    if request_delay_seconds < 0:
-        raise ImproperlyConfigured(
-            'HITHINK_FINANCE_REQUEST_DELAY_SECONDS must not be negative.'
-        )
     return _ClientSettings(
         base_url=get_required_setting('HITHINK_FINANCE_BASE_URL').rstrip('/'),
         api_key=get_required_setting('HITHINK_FINANCE_API_KEY'),
-        timeout_seconds=_positive_integer_setting(
-            'HITHINK_FINANCE_TIMEOUT_SECONDS', minimum=1
-        ),
-        request_delay_seconds=request_delay_seconds,
-        max_retries=_positive_integer_setting('HITHINK_FINANCE_MAX_RETRIES'),
+        timeout_seconds=get_required_int_setting('HITHINK_FINANCE_TIMEOUT_SECONDS', minimum=1),
+        request_delay_seconds=get_required_float_setting('HITHINK_FINANCE_REQUEST_DELAY_SECONDS'),
+        max_retries=get_required_int_setting('HITHINK_FINANCE_MAX_RETRIES'),
     )
 
 
@@ -101,10 +75,6 @@ class HithinkClient:
             },
         )
         return tuple(map_ticker(item) for item in self._items(data))
-
-    def list_trading_days(self):
-        data = self._get('/api/a-share/calendar/trading-days', {})
-        return tuple(map_trading_day(item) for item in self._items(data))
 
     def get_historical_prices(
         self, thscode: str, *, start_date: date, end_date: date

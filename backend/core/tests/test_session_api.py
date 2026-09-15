@@ -24,7 +24,6 @@ class SessionApiTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(body['status'], 'ok')
         self.assertIsNone(body['business_date'])
-        self.assertIsNone(body['data_version'])
         self.assertFalse(body['stale'])
         self.assertEqual(body['source'], 'application')
         self.assertFalse(body['data']['authenticated'])

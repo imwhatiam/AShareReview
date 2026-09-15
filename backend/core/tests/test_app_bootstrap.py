@@ -12,7 +12,8 @@ class CoreAppBootstrapTests(SimpleTestCase):
             {
                 'status': 'ok',
                 'business_date': None,
-                'data_version': None,
+                # 健康检查不服务任何数据，所以没有"数据写入时刻"。
+                'data_updated_at': None,
                 'stale': False,
                 'source': 'application',
                 'preparation': {
@@ -21,7 +22,12 @@ class CoreAppBootstrapTests(SimpleTestCase):
                 },
                 'warnings': [],
                 'error': None,
-                'data': {'healthy': True},
+                # 与 generated_at 同理：交易日覆盖边界随依赖版本和当前年份变，
+                # 这条用例只钉外壳形状，取值由 test_calendar_services 钉。
+                'data': {
+                    'healthy': True,
+                    'trading_calendar': response.json()['data']['trading_calendar'],
+                },
                 'generated_at': response.json()['generated_at'],
             },
         )
